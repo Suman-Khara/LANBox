@@ -1,0 +1,23 @@
+# Build outputs
+/build/
+*.o
+*.out
+*.exe
+
+# CMake files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE stuff
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Generated config/data
+/data/lanbox.json
