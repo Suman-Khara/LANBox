@@ -1,10 +1,16 @@
 #include <bits/stdc++.h>
 #include "json.hpp"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#pragma comment(lib, "ws2_32.lib") // Link Winsock library
 
 using namespace std;
 using json = nlohmann::json;
 
 const string CONFIG_FILE = "../data/lanbox.json";
+const int PORT = 5000;
+const int BUFFER_SIZE = 1024;
 
 void createDefaultConfig() {
     json config;
@@ -35,10 +41,198 @@ void loadConfig() {
     cout << config.dump(4) << "\n";
 }
 
-int main() {
-    cout << "LANBox CLI started!\n";
+void runServer() {
+    WSADATA wsaData;
+    SOCKET server_fd, new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
 
-    loadConfig();
+    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+        cerr << "WSAStartup failed\n";
+        exit(EXIT_FAILURE);
+    }
+
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == INVALID_SOCKET) {
+        cerr << "Socket creation failed\n";
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
+        cerr << "Bind failed\n";
+        closesocket(server_fd);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 3) == SOCKET_ERROR) {
+        cerr << "Listen failed\n";
+        closesocket(server_fd);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    cout << "Server listening on port " << PORT << "...\n";
+
+    new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen);
+    if (new_socket == INVALID_SOCKET) {
+        cerr << "Accept failed\n";
+        closesocket(server_fd);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    cout << "Client connected!\n";
+
+    // --- Receive metadata first ---
+    uint32_t nameLen;
+    recv(new_socket, (char*)&nameLen, sizeof(nameLen), 0);
+    nameLen = ntohl(nameLen);
+
+    string filename(nameLen, '\0');
+    recv(new_socket, filename.data(), nameLen, 0);
+
+    uint64_t fileSize;
+    recv(new_socket, (char*)&fileSize, sizeof(fileSize), 0);
+    fileSize = _byteswap_uint64(fileSize); // network → host (Windows trick)
+
+    cout << "Receiving file: " << filename << " (" << fileSize << " bytes)\n";
+
+    // --- Receive file ---
+    ofstream outfile(filename, ios::binary);
+    char buffer[BUFFER_SIZE];
+    uint64_t received = 0;
+
+    while (received < fileSize) {
+        int bytesRead = recv(new_socket, buffer, BUFFER_SIZE, 0);
+        if (bytesRead <= 0) break;
+
+        outfile.write(buffer, bytesRead);
+        received += bytesRead;
+
+        // --- Progress display ---
+        double receivedMB = received / (1024.0 * 1024.0);
+        double totalMB = fileSize / (1024.0 * 1024.0);
+
+        cout << "\rReceived: " << fixed << setprecision(2)
+            << receivedMB << " MB / " << totalMB << " MB" << flush;
+    }
+
+    cout << "\nFile received successfully!\n";
+
+    outfile.close();
+    closesocket(new_socket);
+    closesocket(server_fd);
+    WSACleanup();
+}
+
+void runClient(const string &server_ip, const string &filename) {
+    WSADATA wsaData;
+    SOCKET sock;
+    struct sockaddr_in serv_addr;
+
+    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
+        cerr << "WSAStartup failed\n";
+        exit(EXIT_FAILURE);
+    }
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
+        cerr << "Socket creation failed\n";
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_port = htons(PORT);
+
+    if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
+        cerr << "Invalid address\n";
+        closesocket(sock);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == SOCKET_ERROR) {
+        cerr << "Connection failed\n";
+        closesocket(sock);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    cout << "Connected to server. Sending file...\n";
+
+    // Open file
+    ifstream infile(filename, ios::binary | ios::ate);
+    if (!infile.is_open()) {
+        cerr << "Cannot open file: " << filename << "\n";
+        closesocket(sock);
+        WSACleanup();
+        exit(EXIT_FAILURE);
+    }
+
+    uint64_t fileSize = infile.tellg();
+    infile.seekg(0);
+
+    // Extract just the base filename (no path)
+    string baseName = filename.substr(filename.find_last_of("/\\") + 1);
+
+    // --- Send metadata ---
+    uint32_t nameLen = htonl(baseName.size());
+    send(sock, (char*)&nameLen, sizeof(nameLen), 0);
+    send(sock, baseName.c_str(), baseName.size(), 0);
+
+    uint64_t sizeNet = _byteswap_uint64(fileSize); // host → network
+    send(sock, (char*)&sizeNet, sizeof(sizeNet), 0);
+
+    // --- Send file ---
+    char buffer[BUFFER_SIZE];
+    uint64_t sent = 0;
+
+    while (!infile.eof()) {
+        infile.read(buffer, BUFFER_SIZE);
+        int bytesRead = infile.gcount();
+        if (bytesRead <= 0) break;
+
+        send(sock, buffer, bytesRead, 0);
+        sent += bytesRead;
+
+        // Progress display
+        double progress = (double)sent / fileSize * 100.0;
+
+        cout << "\rSent: " << (sent / (1024.0 * 1024.0)) << " MB / "
+            << (fileSize / (1024.0 * 1024.0)) << " MB ("
+            << fixed << setprecision(2) << progress << "%)" << flush;
+    }
+
+    cout << "\nFile sent successfully!\n";
+
+    infile.close();
+    closesocket(sock);
+    WSACleanup();
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        cout << "Usage:\n";
+        cout << "  lanbox.exe server\n";
+        cout << "  lanbox.exe send <server_ip> <filename>\n";
+        return 1;
+    }
+
+    string mode = argv[1];
+    if (mode == "server") {
+        runServer();
+    } else if (mode == "send" && argc == 4) {
+        runClient(argv[2], argv[3]);
+    } else {
+        cout << "Invalid arguments\n";
+    }
 
     return 0;
 }
