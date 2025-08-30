@@ -9,3 +9,8 @@ include_directories(include)
 
 # Add source files
 add_executable(lanbox src/main.cpp)
+
+# Link Windows socket library
+if (WIN32)
+    target_link_libraries(lanbox PRIVATE ws2_32)
+endif()
