@@ -2,10 +2,12 @@
 #include "json.hpp"
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <chrono>
 
 #pragma comment(lib, "ws2_32.lib") // Link Winsock library
 
 using namespace std;
+using namespace chrono;
 using json = nlohmann::json;
 
 const string CONFIG_FILE = "../data/lanbox.json";
@@ -107,6 +109,7 @@ void runServer() {
     ofstream outfile(filename, ios::binary);
     char buffer[BUFFER_SIZE];
     uint64_t received = 0;
+    auto start = steady_clock::now();
 
     while (received < fileSize) {
         int bytesRead = recv(new_socket, buffer, BUFFER_SIZE, 0);
@@ -117,13 +120,36 @@ void runServer() {
 
         // --- Progress display ---
         double receivedMB = received / (1024.0 * 1024.0);
-        double totalMB = fileSize / (1024.0 * 1024.0);
+        double totalMB   = fileSize / (1024.0 * 1024.0);
+
+        auto now = std::chrono::steady_clock::now();
+        double elapsedSec = std::chrono::duration<double>(now - start).count();
+
+        double speedMBps = (received / (1024.0 * 1024.0)) / elapsedSec; // MB/s
+
+        double remainingMB = totalMB - receivedMB;
+        double etaSec = (speedMBps > 0) ? (remainingMB / speedMBps) : -1;
+
+        // Format ETA
+        int etaMin = (etaSec > 0) ? static_cast<int>(etaSec / 60) : 0;
+        int etaS   = (etaSec > 0) ? static_cast<int>(etaSec) % 60 : 0;
 
         cout << "\rReceived: " << fixed << setprecision(2)
-            << receivedMB << " MB / " << totalMB << " MB" << flush;
+            << receivedMB << " MB / " << totalMB << " MB"
+            << " | Speed: " << setprecision(2) << speedMBps << " MB/s"
+            << " | ETA: ";
+        if (etaSec > 0)
+            cout << etaMin << "m " << etaS << "s   ";
+        else
+            cout << "--   ";
+
+        cout.flush();
     }
 
-    cout << "\nFile received successfully!\n";
+    auto end = steady_clock::now();
+    double totalTime = duration<double>(end - start).count();
+    cout << "\nFile received successfully in " << fixed << setprecision(2)
+        << totalTime << " seconds.\n";
 
     outfile.close();
     closesocket(new_socket);
@@ -194,6 +220,8 @@ void runClient(const string &server_ip, const string &filename) {
     char buffer[BUFFER_SIZE];
     uint64_t sent = 0;
 
+    auto start = steady_clock::now();
+
     while (!infile.eof()) {
         infile.read(buffer, BUFFER_SIZE);
         int bytesRead = infile.gcount();
@@ -202,15 +230,40 @@ void runClient(const string &server_ip, const string &filename) {
         send(sock, buffer, bytesRead, 0);
         sent += bytesRead;
 
-        // Progress display
+        // Progress & speed
+        auto now = steady_clock::now();
+        double elapsedSec = duration<double>(now - start).count();
+
+        double sentMB   = sent / (1024.0 * 1024.0);
+        double totalMB  = fileSize / (1024.0 * 1024.0);
+        double speedMBs = (sentMB / elapsedSec); // MB/s
+
+        double remainingMB = totalMB - sentMB;
+        double etaSec = (speedMBs > 0) ? (remainingMB / speedMBs) : -1;
+
+        int etaMin = (etaSec > 0) ? static_cast<int>(etaSec / 60) : 0;
+        int etaS   = (etaSec > 0) ? static_cast<int>(etaSec) % 60 : 0;
+
         double progress = (double)sent / fileSize * 100.0;
 
-        cout << "\rSent: " << (sent / (1024.0 * 1024.0)) << " MB / "
-            << (fileSize / (1024.0 * 1024.0)) << " MB ("
-            << fixed << setprecision(2) << progress << "%)" << flush;
+        cout << "\rSent: " << fixed << setprecision(2)
+            << sentMB << " MB / " << totalMB << " MB ("
+            << progress << "%)"
+            << " | Speed: " << setprecision(2) << speedMBs << " MB/s"
+            << " | ETA: ";
+        if (etaSec > 0)
+            cout << etaMin << "m " << etaS << "s   ";
+        else
+            cout << "--   ";
+
+        cout.flush();
     }
 
+    auto end = steady_clock::now();
+    double totalTimeSec = duration<double>(end - start).count();
     cout << "\nFile sent successfully!\n";
+    cout << "Total time: " << fixed << setprecision(2) 
+        << totalTimeSec << " seconds\n";
 
     infile.close();
     closesocket(sock);
