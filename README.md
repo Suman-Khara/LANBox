@@ -26,10 +26,11 @@ git clone https://github.com/Suman-Khara/LANBox
 cd lanbox
 
 # Create build directory
-mkdir build && cd build
+mkdir build
+cd build
 
 # Configure project with CMake
-cmake ..
+cmake -G "MinGW Makefiles" ..
 
 # Build the executable
 cmake --build .
