@@ -194,7 +194,7 @@ void sendFile(const string &server_ip, const string &filename) {
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         cerr << "Socket creation failed\n";
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
     
