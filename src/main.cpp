@@ -1,10 +1,21 @@
 #include <bits/stdc++.h>
 #include "json.hpp"
-#include <winsock2.h>
-#include <ws2tcpip.h>
 #include <chrono>
 
-#pragma comment(lib, "ws2_32.lib") // Link Winsock library
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+    typedef SOCKET SocketType;
+#else
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <unistd.h>
+    typedef int SocketType;
+    #define INVALID_SOCKET -1
+    #define SOCKET_ERROR   -1
+    inline void closesocket(SocketType s) { close(s); }
+#endif
 
 using namespace std;
 using namespace chrono;
@@ -12,7 +23,22 @@ using json = nlohmann::json;
 
 const string CONFIG_FILE = "../data/lanbox.json";
 const int PORT = 5000;
-const int BUFFER_SIZE = 1024;
+const int BUFFER_SIZE = 64 * 1024; // 64 KB
+
+bool initSockets() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    return (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0);
+#else
+    return true;
+#endif
+}
+
+void cleanupSockets() {
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
 
 void createDefaultConfig() {
     json config;
@@ -43,24 +69,20 @@ void loadConfig() {
     cout << config.dump(4) << "\n";
 }
 
-void runServer() {
-    WSADATA wsaData;
-    SOCKET server_fd, new_socket;
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
-
-    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
-        cerr << "WSAStartup failed\n";
-        exit(EXIT_FAILURE);
+void receiveFile() {
+    if (!initSockets()) {
+        cerr << "Socket init failed\n";
+        return;
     }
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    SocketType server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd == INVALID_SOCKET) {
         cerr << "Socket creation failed\n";
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
+    sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
@@ -68,24 +90,24 @@ void runServer() {
     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) == SOCKET_ERROR) {
         cerr << "Bind failed\n";
         closesocket(server_fd);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
     if (listen(server_fd, 3) == SOCKET_ERROR) {
         cerr << "Listen failed\n";
         closesocket(server_fd);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
     cout << "Server listening on port " << PORT << "...\n";
-
-    new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen);
+    socklen_t addrlen = sizeof(address);
+    SocketType new_socket = accept(server_fd, (struct sockaddr*)&address, &addrlen);
     if (new_socket == INVALID_SOCKET) {
         cerr << "Accept failed\n";
         closesocket(server_fd);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
@@ -99,9 +121,14 @@ void runServer() {
     string filename(nameLen, '\0');
     recv(new_socket, filename.data(), nameLen, 0);
 
-    uint64_t fileSize;
-    recv(new_socket, (char*)&fileSize, sizeof(fileSize), 0);
-    fileSize = _byteswap_uint64(fileSize); // network → host (Windows trick)
+    uint64_t netFileSize;
+    recv(new_socket, (char*)&netFileSize, sizeof(netFileSize), 0);
+
+#if defined(_WIN32)
+    uint64_t fileSize = _byteswap_uint64(netFileSize);
+#else
+    uint64_t fileSize = be64toh(netFileSize);
+#endif
 
     cout << "Receiving file: " << filename << " (" << fileSize << " bytes)\n";
 
@@ -154,40 +181,38 @@ void runServer() {
     outfile.close();
     closesocket(new_socket);
     closesocket(server_fd);
-    WSACleanup();
+    cleanupSockets();
 }
 
-void runClient(const string &server_ip, const string &filename) {
-    WSADATA wsaData;
-    SOCKET sock;
-    struct sockaddr_in serv_addr;
-
-    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
-        cerr << "WSAStartup failed\n";
-        exit(EXIT_FAILURE);
+void sendFile(const string &server_ip, const string &filename) {
+    if (!initSockets()) {
+        cerr << "Socket init failed\n";
+        return;
     }
-
+    
+    SocketType sock;
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock == INVALID_SOCKET) {
         cerr << "Socket creation failed\n";
         WSACleanup();
         exit(EXIT_FAILURE);
     }
-
+    
+    sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(PORT);
 
     if (inet_pton(AF_INET, server_ip.c_str(), &serv_addr.sin_addr) <= 0) {
         cerr << "Invalid address\n";
         closesocket(sock);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
     if (connect(sock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) == SOCKET_ERROR) {
         cerr << "Connection failed\n";
         closesocket(sock);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
@@ -198,7 +223,7 @@ void runClient(const string &server_ip, const string &filename) {
     if (!infile.is_open()) {
         cerr << "Cannot open file: " << filename << "\n";
         closesocket(sock);
-        WSACleanup();
+        cleanupSockets();
         exit(EXIT_FAILURE);
     }
 
@@ -213,7 +238,11 @@ void runClient(const string &server_ip, const string &filename) {
     send(sock, (char*)&nameLen, sizeof(nameLen), 0);
     send(sock, baseName.c_str(), baseName.size(), 0);
 
-    uint64_t sizeNet = _byteswap_uint64(fileSize); // host → network
+#if defined(_WIN32)
+    uint64_t sizeNet = _byteswap_uint64(fileSize);
+#else
+    uint64_t sizeNet = htobe64(fileSize);
+#endif
     send(sock, (char*)&sizeNet, sizeof(sizeNet), 0);
 
     // --- Send file ---
@@ -267,7 +296,7 @@ void runClient(const string &server_ip, const string &filename) {
 
     infile.close();
     closesocket(sock);
-    WSACleanup();
+    cleanupSockets();
 }
 
 int main(int argc, char* argv[]) {
@@ -280,9 +309,9 @@ int main(int argc, char* argv[]) {
 
     string mode = argv[1];
     if (mode == "server") {
-        runServer();
+        receiveFile();
     } else if (mode == "send" && argc == 4) {
-        runClient(argv[2], argv[3]);
+        sendFile(argv[2], argv[3]);
     } else {
         cout << "Invalid arguments\n";
     }
