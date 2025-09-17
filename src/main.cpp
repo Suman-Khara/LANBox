@@ -1,6 +1,17 @@
 #include <bits/stdc++.h>
 #include "json.hpp"
+#include "config.hpp"
+#include "discovery.hpp"
+#include "peer.hpp"
+
 #include <chrono>
+#include <csignal>
+
+void handleSignal(int) {
+    cout << "\nStopping LANBox..." << endl;
+    Discovery::stop();
+    exit(0);
+}
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -38,35 +49,6 @@ void cleanupSockets() {
 #ifdef _WIN32
     WSACleanup();
 #endif
-}
-
-void createDefaultConfig() {
-    json config;
-    config["device_id"] = "device-" + to_string(rand() % 10000);
-    config["shared_folder"] = "./LANBoxFolder";
-    config["last_updated"] = "2025-08-25T10:00:00";
-    config["files"] = json::array();
-
-    ofstream file(CONFIG_FILE);
-    file << config.dump(4);
-    file.close();
-
-    cout << "Created new config at " << CONFIG_FILE << "\n";
-}
-
-void loadConfig() {
-    ifstream file(CONFIG_FILE);
-    if (!file.is_open()) {
-        cout << "No config found. Creating default...\n";
-        createDefaultConfig();
-        return;
-    }
-
-    json config;
-    file >> config;
-
-    cout << "Loaded config:\n";
-    cout << config.dump(4) << "\n";
 }
 
 void receiveFile() {
@@ -300,10 +282,14 @@ void sendFile(const string &server_ip, const string &filename) {
 }
 
 int main(int argc, char* argv[]) {
+    Config cfg;
+    Discovery::start(cfg);
+
     if (argc < 2) {
         cout << "Usage:\n";
         cout << "  lanbox.exe server\n";
         cout << "  lanbox.exe send <server_ip> <filename>\n";
+        cout << "  lanbox.exe peers\n";
         return 1;
     }
 
@@ -312,9 +298,12 @@ int main(int argc, char* argv[]) {
         receiveFile();
     } else if (mode == "send" && argc == 4) {
         sendFile(argv[2], argv[3]);
+    } else if (mode == "peers") {
+        cfg.printPeers();
     } else {
         cout << "Invalid arguments\n";
     }
 
+    signal(SIGINT, handleSignal);
     return 0;
 }
