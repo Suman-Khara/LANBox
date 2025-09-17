@@ -7,8 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 include_directories(include)
 
+file(GLOB SOURCES "src/*.cpp")
 # Add source files
-add_executable(lanbox src/main.cpp)
+add_executable(lanbox ${SOURCES})
 
 # Link Windows socket library
 if (WIN32)
