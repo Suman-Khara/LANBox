@@ -15,7 +15,7 @@ void handleSignal(int) {
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
-    #define _HAS_STD_BYTE 0  // prevent conflict with std::byte
+    #define _HAS_STD_BYTE 0  // prevent conflict with byte
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
@@ -133,8 +133,8 @@ void receiveFile() {
         double receivedMB = received / (1024.0 * 1024.0);
         double totalMB   = fileSize / (1024.0 * 1024.0);
 
-        auto now = std::chrono::steady_clock::now();
-        double elapsedSec = std::chrono::duration<double>(now - start).count();
+        auto now = chrono::steady_clock::now();
+        double elapsedSec = chrono::duration<double>(now - start).count();
 
         double speedMBps = (received / (1024.0 * 1024.0)) / elapsedSec; // MB/s
 
@@ -301,8 +301,13 @@ int main(int argc, char* argv[]) {
     } else if (mode == "send" && argc == 4) {
         sendFile(argv[2], argv[3]);
     } else if (mode == "peers") {
-        cfg.printPeers();
-    } else {
+        for (int i = 0; i < 5; i++) {  // refresh 5 times
+            this_thread::sleep_for(chrono::seconds(2));
+            cout << "---- Current peers ----\n";
+            cfg.printPeers();
+        }
+    }
+    else {
         cout << "Invalid arguments\n";
     }
 
