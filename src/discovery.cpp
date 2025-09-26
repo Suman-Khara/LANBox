@@ -42,6 +42,46 @@ string getHostName() {
     return "UnknownDevice";
 }
 
+string getLocalIP() {
+#ifdef _WIN32
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        return "0.0.0.0";
+    }
+#endif
+
+    string localIP = "0.0.0.0";
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        return localIP;
+    }
+
+    sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);  // arbitrary
+    inet_pton(AF_INET, "1.168.1.1", &addr.sin_addr); // dummy LAN address
+
+    // We don't care if it succeeds, no packets sent
+    connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+
+    sockaddr_in name;
+    socklen_t namelen = sizeof(name);
+    if (getsockname(sock, (struct sockaddr*)&name, &namelen) == 0) {
+        char buffer[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &name.sin_addr, buffer, sizeof(buffer));
+        localIP = buffer;
+    }
+
+#ifdef _WIN32
+    closesocket(sock);
+    WSACleanup();
+#else
+    close(sock);
+#endif
+
+    return localIP;
+}
+
 namespace {
 
     void senderLoop(Config& cfg, int port, int interval_sec) {
@@ -125,7 +165,7 @@ namespace {
                         char senderIP[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIP, INET_ADDRSTRLEN);
                         p.setIP(senderIP);
-
+                        p.setSelf(p.getIP() == getLocalIP());
                         cfg.addOrUpdatePeer(p);
                     }
                 } catch (const exception& e) {
