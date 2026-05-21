@@ -21,3 +21,6 @@ Thumbs.db
 
 # Generated config/data
 /data/lanbox.json
+
+#output files
+output.txt
