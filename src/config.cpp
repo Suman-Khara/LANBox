@@ -3,8 +3,43 @@
 #include <iostream>
 #include <iomanip>
 #include <ctime>
+#include <sys/stat.h>
+#include <sys/types.h>
+#ifdef _WIN32
+    #include <direct.h>
+#endif
+// Add this helper function at the top
+static bool createDirectoryIfNotExists(const string& path) {
+#ifdef _WIN32
+    // Windows: extract directory from full path
+    size_t pos = path.find_last_of("/\\");
+    if (pos == string::npos) return true;
+    
+    string dir = path.substr(0, pos);
+    struct _stat info;
+    if (_stat(dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        return _mkdir(dir.c_str()) == 0;
+    }
+#else
+    // Linux: extract directory from full path
+    size_t pos = path.find_last_of('/');
+    if (pos == string::npos) return true;
+    
+    string dir = path.substr(0, pos);
+    struct stat info;
+    if (stat(dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it (0755 permissions)
+        return mkdir(dir.c_str(), 0755) == 0;
+    }
+#endif
+    return true;  // Directory already exists
+}
 
-Config::Config(const string& path) : filepath(path) {}
+Config::Config(const string& path) : filepath(path) {
+    // Ensure directory exists
+    createDirectoryIfNotExists(filepath);
+}
 
 bool Config::load() {
     ifstream file(filepath);

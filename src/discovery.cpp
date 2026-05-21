@@ -1,3 +1,4 @@
+#include "platform.hpp"  // Include this FIRST
 #include "discovery.hpp"
 #include <bits/stdc++.h>
 #include "json.hpp"
@@ -17,7 +18,6 @@
     typedef int SocketType;
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR   -1
-    inline void closesocket(SocketType s) { close(s); }
 #endif
 
 using namespace std;
@@ -148,11 +148,17 @@ namespace {
             return;
         }
 
+        // Set socket timeout so we can check running flag periodically
+        struct timeval tv;
+        tv.tv_sec = 1;   // 1 second timeout
+        tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
         char buffer[2048];
         while (Discovery::isRunning()) {
             sockaddr_in senderAddr{};
             socklen_t senderLen = sizeof(senderAddr);
-            int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&senderAddr, &senderLen);
+            int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&senderAddr, &senderLen);
 
             if (bytes > 0) {
                 buffer[bytes] = '\0';
@@ -169,9 +175,24 @@ namespace {
                         cfg.addOrUpdatePeer(p);
                     }
                 } catch (const exception& e) {
-                    cerr << "JSON parse error: " << e.what() << endl;
+                    // Ignore parse errors - might be from other software
                 }
+            } else if (bytes == SOCKET_ERROR) {
+                // Timeout or error - check if we should continue
+    #ifdef _WIN32
+                int err = WSAGetLastError();
+                if (err != WSAETIMEDOUT && err != WSAEWOULDBLOCK) {
+                    cerr << "Receive error: " << err << "\n";
+                    break;
+                }
+    #else
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    cerr << "Receive error: " << strerror(errno) << "\n";
+                    break;
+                }
+    #endif
             }
+            // On timeout (bytes < 0), loop continues and checks running flag
         }
 
         closesocket(sock);

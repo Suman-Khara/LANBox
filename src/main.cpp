@@ -1,16 +1,28 @@
+#include "platform.hpp"  // Include this FIRST
 #include <bits/stdc++.h>
 #include "json.hpp"
 #include "config.hpp"
 #include "discovery.hpp"
 #include "peer.hpp"
-
+#include "network_interface.hpp"
 #include <chrono>
 #include <csignal>
+#include <atomic>
+
+// Global flag for signal handling
+atomic<bool> g_running(true);
 
 void handleSignal(int) {
-    cout << "\nStopping LANBox..." << endl;
+    if (!g_running) {
+        // Second Ctrl+C - force exit
+        cout << "\nForce stopping...\n";
+        exit(1);
+    }
+    
+    cout << "\n\nReceived interrupt signal. Shutting down gracefully...\n";
+    cout << "(Press Ctrl+C again to force quit)\n";
+    g_running = false;
     Discovery::stop();
-    exit(0);
 }
 
 #ifdef _WIN32
@@ -27,7 +39,6 @@ void handleSignal(int) {
     typedef int SocketType;
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR   -1
-    inline void closesocket(SocketType s) { close(s); }
 #endif
 
 using namespace std;
@@ -284,33 +295,90 @@ void sendFile(const string &server_ip, const string &filename) {
 }
 
 int main(int argc, char* argv[]) {
-    Config cfg;
-    Discovery::start(cfg);
-
     if (argc < 2) {
+        cout << "LANBox - LAN File Synchronization Tool\n";
+        cout << "========================================\n";
         cout << "Usage:\n";
-        cout << "  lanbox.exe server\n";
-        cout << "  lanbox.exe send <server_ip> <filename>\n";
-        cout << "  lanbox.exe peers\n";
+        cout << "  lanbox server              - Start file receive server\n";
+        cout << "  lanbox send <ip> <file>    - Send file to peer\n";
+        cout << "  lanbox peers               - Show discovered peers\n";
+        cout << "  lanbox interfaces          - Show network interfaces\n";
+        cout << "  lanbox discover            - Start peer discovery\n";
         return 1;
     }
 
     string mode = argv[1];
+    
+    // Commands that DON'T need discovery running
+    if (mode == "interfaces") {
+        auto interfaces = NetworkInterfaceManager::getActiveInterfaces();
+        NetworkInterfaceManager::printInterfaces(interfaces);
+        return 0;
+    }
+    
     if (mode == "server") {
         receiveFile();
-    } else if (mode == "send" && argc == 4) {
+        return 0;
+    }
+    
+    if (mode == "send" && argc == 4) {
         sendFile(argv[2], argv[3]);
-    } else if (mode == "peers") {
-        for (int i = 0; i < 5; i++) {  // refresh 5 times
-            this_thread::sleep_for(chrono::seconds(2));
-            cout << "---- Current peers ----\n";
-            cfg.printPeers();
+        return 0;
+    }
+    
+    // Commands that NEED discovery running
+    Config cfg;
+    cfg.load();
+    
+    if (mode == "discover") {
+        // Setup signal handler BEFORE starting discovery
+        signal(SIGINT, handleSignal);
+        signal(SIGTERM, handleSignal);
+        
+        cout << "Starting peer discovery...\n";
+        cout << "Press Ctrl+C to stop.\n\n";
+        
+        Discovery::start(cfg);
+        
+        // Keep running and display peers periodically
+        int counter = 0;
+        while (g_running) {
+            this_thread::sleep_for(chrono::seconds(1));
+            
+            if (++counter % 5 == 0) {  // Every 5 seconds
+                cout << "\r=== Discovered Peers (refresh #" << counter/5 << ") ===\n";
+                cfg.printPeers();
+                cfg.save();
+                cout << "\n";
+            } else {
+                // Show simple status
+                auto peers = cfg.getPeers();
+                size_t active_count = 0;
+                for (const auto& p : peers) {
+                    if (!p.isSelf()) active_count++;
+                }
+                cout << "\r[Active] Peers: " << active_count << " | Time: " << counter << "s   ";
+                cout.flush();
+            }
         }
+        
+        cout << "\n\nStopping discovery...\n";
+        Discovery::stop();
+        
+        cout << "\nFinal peer list:\n";
+        cfg.printPeers();
+        cfg.save();
+        
+        cout << "\nShutdown complete.\n";
+        return 0;
     }
-    else {
-        cout << "Invalid arguments\n";
+    
+    if (mode == "peers") {
+        cout << "=== Current Peers (from saved config) ===\n";
+        cfg.printPeers();
+        return 0;
     }
-
-    signal(SIGINT, handleSignal);
-    return 0;
+    
+    cout << "Invalid command. Use 'lanbox' without arguments to see usage.\n";
+    return 1;
 }
