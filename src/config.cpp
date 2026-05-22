@@ -132,3 +132,37 @@ void Config::printPeers() const {
         cout << "\n";
     }
 }
+
+Peer* Config::findPeer(const string& nameOrIP) {
+    for (auto& peer : peers) {
+        // Check if matches name (case-insensitive)
+        string peerName = peer.getName();
+        transform(peerName.begin(), peerName.end(), peerName.begin(), ::tolower);
+        string searchName = nameOrIP;
+        transform(searchName.begin(), searchName.end(), searchName.begin(), ::tolower);
+        
+        if (peerName == searchName) {
+            return &peer;
+        }
+        
+        // Check if matches IP
+        if (peer.getIP() == nameOrIP) {
+            return &peer;
+        }
+    }
+    return nullptr;  // Not found
+}
+
+bool Config::hasPeer(const string& nameOrIP) const {
+    for (const auto& peer : peers) {
+        string peerName = peer.getName();
+        transform(peerName.begin(), peerName.end(), peerName.begin(), ::tolower);
+        string searchName = nameOrIP;
+        transform(searchName.begin(), searchName.end(), searchName.begin(), ::tolower);
+        
+        if (peerName == searchName || peer.getIP() == nameOrIP) {
+            return true;
+        }
+    }
+    return false;
+}

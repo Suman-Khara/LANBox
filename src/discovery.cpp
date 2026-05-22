@@ -1,12 +1,13 @@
-#include "platform.hpp"  // Include this FIRST
 #include "discovery.hpp"
+#include "protocol.hpp"
+#include "network_interface.hpp"
 #include <bits/stdc++.h>
-#include "json.hpp"
 #include <chrono>
+#include <set>
 
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
-    #define _HAS_STD_BYTE 0  // prevent conflict with std::byte
+    #define _HAS_STD_BYTE 0
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
@@ -18,15 +19,16 @@
     typedef int SocketType;
     #define INVALID_SOCKET -1
     #define SOCKET_ERROR   -1
+    inline void closesocket(SocketType s) { close(s); }
 #endif
 
 using namespace std;
 using namespace chrono;
-using json = nlohmann::json;
 
 extern bool initSockets();
 extern void cleanupSockets();
 
+// Get hostname
 string getHostName() {
     char hostname[256];
 #ifdef _WIN32
@@ -42,6 +44,7 @@ string getHostName() {
     return "UnknownDevice";
 }
 
+// Get local IP (same as before)
 string getLocalIP() {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -58,10 +61,9 @@ string getLocalIP() {
 
     sockaddr_in addr;
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);  // arbitrary
-    inet_pton(AF_INET, "1.168.1.1", &addr.sin_addr); // dummy LAN address
+    addr.sin_port = htons(80);
+    inet_pton(AF_INET, "8.8.8.8", &addr.sin_addr);
 
-    // We don't care if it succeeds, no packets sent
     connect(sock, (struct sockaddr*)&addr, sizeof(addr));
 
     sockaddr_in name;
@@ -82,8 +84,68 @@ string getLocalIP() {
     return localIP;
 }
 
-namespace {
+// Check if IP is in private range
+bool isPrivateIP(const string& ip) {
+    uint32_t ip_uint = Protocol::ipToUint32(ip);
+    
+    // 10.0.0.0/8
+    if ((ip_uint & 0xFF000000) == 0x0A000000) return true;
+    
+    // 172.16.0.0/12
+    if ((ip_uint & 0xFFF00000) == 0xAC100000) return true;
+    
+    // 192.168.0.0/16
+    if ((ip_uint & 0xFFFF0000) == 0xC0A80000) return true;
+    
+    return false;
+}
 
+namespace {
+    static uint32_t g_sequence_number = 0;
+    static set<uint32_t> g_seen_sequences;
+    static time_t g_last_cleanup = time(nullptr);
+    static map<string, pair<int, time_t>> g_packet_counts;  // IP -> (count, timestamp)
+    
+    const int MAX_PACKETS_PER_IP_PER_SEC = 50;
+    
+    // Clean old sequence numbers periodically
+    void cleanupSequences() {
+        time_t now = time(nullptr);
+        if (now - g_last_cleanup > 60) {  // Every 60 seconds
+            g_seen_sequences.clear();
+            g_packet_counts.clear();
+            g_last_cleanup = now;
+        }
+    }
+    
+    // Check rate limiting per IP
+    bool checkRateLimit(const string& ip) {
+        time_t now = time(nullptr);
+        
+        if (g_packet_counts.find(ip) == g_packet_counts.end()) {
+            g_packet_counts[ip] = {1, now};
+            return true;
+        }
+        
+        auto& [count, timestamp] = g_packet_counts[ip];
+        
+        if (now - timestamp >= 1) {
+            // Reset counter for new second
+            count = 1;
+            timestamp = now;
+            return true;
+        }
+        
+        if (count >= MAX_PACKETS_PER_IP_PER_SEC) {
+            // Too many packets from this IP
+            return false;
+        }
+        
+        count++;
+        return true;
+    }
+
+    // Sender thread - broadcasts discovery using BINARY protocol
     void senderLoop(Config& cfg, int port, int interval_sec) {
         if (!initSockets()) {
             cerr << "Socket init failed (sender)\n";
@@ -93,7 +155,6 @@ namespace {
         SocketType sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock == INVALID_SOCKET) {
             cerr << "Failed to create UDP socket\n";
-            cleanupSockets();
             return;
         }
 
@@ -105,22 +166,36 @@ namespace {
         broadcastAddr.sin_port = htons(port);
         broadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
-        while (Discovery::isRunning()) {
-            json j = {
-                {"type", "hello"},
-                {"name", getHostName()},
-                {"port", 5000},
-                {"last_seen", duration_cast<seconds>(system_clock::now().time_since_epoch()).count()}
-            };
+        string hostname = getHostName();
+        string localIP = getLocalIP();
+        uint32_t sender_ip = Protocol::ipToUint32(localIP);
 
-            string msg = j.dump();
-            sendto(sock, msg.c_str(), msg.size(), 0, (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+        cout << "[Sender] Broadcasting as " << hostname << " (" << localIP << ")\n";
+
+        while (Discovery::isRunning()) {
+            // Create binary discovery message
+            vector<uint8_t> message = Protocol::createDiscoveryRequest(
+                hostname,
+                sender_ip,
+                5000,  // TCP port for file transfer
+                g_sequence_number++
+            );
+
+            // Send the binary message
+            int sent = sendto(sock, (char*)message.data(), message.size(), 0, 
+                            (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
+            
+            if (sent < 0) {
+                cerr << "[Sender] Send failed\n";
+            } else {
+                // Uncomment for debugging
+                // cout << "[Sender] Sent " << sent << " bytes (binary protocol)\n";
+            }
 
             this_thread::sleep_for(seconds(interval_sec));
         }
 
         closesocket(sock);
-        cleanupSockets();
     }
 
     void listenerLoop(Config& cfg, int port) {
@@ -132,7 +207,6 @@ namespace {
         SocketType sock = socket(AF_INET, SOCK_DGRAM, 0);
         if (sock == INVALID_SOCKET) {
             cerr << "Failed to create UDP socket\n";
-            cleanupSockets();
             return;
         }
 
@@ -144,82 +218,189 @@ namespace {
         if (bind(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
             cerr << "Bind failed\n";
             closesocket(sock);
-            cleanupSockets();
             return;
         }
 
-        // Set socket timeout so we can check running flag periodically
         struct timeval tv;
-        tv.tv_sec = 1;   // 1 second timeout
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
 
-        char buffer[2048];
+        cout << "[Listener] Listening on port " << port << " (binary protocol)\n";
+
+        char buffer[8192];
+        string localIP = getLocalIP();
+        string hostname = getHostName();
+        uint32_t local_ip_uint = Protocol::ipToUint32(localIP);
+
         while (Discovery::isRunning()) {
             sockaddr_in senderAddr{};
             socklen_t senderLen = sizeof(senderAddr);
-            int bytes = recvfrom(sock, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&senderAddr, &senderLen);
+            
+            int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, 
+                            (sockaddr*)&senderAddr, &senderLen);
 
             if (bytes > 0) {
-                buffer[bytes] = '\0';
-                try {
-                    json j = json::parse(buffer);
-                    if (j["type"] == "hello") {
-                        Peer p;
-                        from_json(j, p);
+                char senderIP[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIP, INET_ADDRSTRLEN);
+                string sender_ip_str = senderIP;
 
-                        char senderIP[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, &(senderAddr.sin_addr), senderIP, INET_ADDRSTRLEN);
-                        p.setIP(senderIP);
-                        p.setSelf(p.getIP() == getLocalIP());
+                // Security checks
+                cleanupSequences();
+                
+                if (!isPrivateIP(sender_ip_str)) continue;
+                if (!checkRateLimit(sender_ip_str)) continue;
+                if (bytes < (int)HEADER_SIZE || bytes > (int)MAX_PAYLOAD_SIZE) continue;
+
+                LANBoxHeader header;
+                vector<uint8_t> payload;
+                
+                if (!Protocol::parseMessage((uint8_t*)buffer, bytes, header, payload)) {
+                    continue;
+                }
+
+                if (!Protocol::validateMessage((uint8_t*)buffer, bytes)) {
+                    cerr << "[Listener] Invalid checksum from " << sender_ip_str << "\n";
+                    continue;
+                }
+
+                uint32_t seq = ntohl(header.sequence_number);
+                if (g_seen_sequences.count(seq)) continue;
+                g_seen_sequences.insert(seq);
+
+                MessageType msg_type = static_cast<MessageType>(ntohs(header.message_type));
+                
+                if (msg_type == MessageType::DISCOVERY_REQUEST) {
+                    if (payload.size() >= sizeof(DiscoveryPayload)) {
+                        DiscoveryPayload disc_payload;
+                        memcpy(&disc_payload, payload.data(), sizeof(disc_payload));
+                        
+                        string device_name = string(disc_payload.device_name);
+                        uint16_t tcp_port = ntohs(disc_payload.tcp_port);
+                        
+                        // Add peer to list
+                        Peer p;
+                        p.setName(device_name);
+                        p.setIP(sender_ip_str);
+                        p.setPort(tcp_port);
+                        p.setLastSeen(time(nullptr));
+                        p.setSelf(sender_ip_str == localIP);
+                        
+                        cfg.addOrUpdatePeer(p);
+                        
+                        // *** NEW: Send RESPONSE back to sender ***
+                        if (sender_ip_str != localIP) {  // Don't respond to ourselves
+                            vector<uint8_t> response = Protocol::createDiscoveryRequest(
+                                hostname,
+                                local_ip_uint,
+                                5000,
+                                g_sequence_number++
+                            );
+                            
+                            // Change message type to RESPONSE
+                            LANBoxHeader* resp_header = (LANBoxHeader*)response.data();
+                            resp_header->message_type = htons(static_cast<uint16_t>(MessageType::DISCOVERY_RESPONSE));
+                            
+                            // Recalculate checksum
+                            resp_header->checksum = 0;
+                            uint32_t crc = Protocol::calculateCRC32(response.data(), response.size());
+                            resp_header->checksum = htonl(crc);
+                            
+                            // Send directly to sender (unicast, not broadcast)
+                            sendto(sock, (char*)response.data(), response.size(), 0,
+                                (sockaddr*)&senderAddr, senderLen);
+                            
+                            // Uncomment for debugging
+                            // cout << "[Listener] Sent response to " << device_name << "\n";
+                        }
+                    }
+                } 
+                else if (msg_type == MessageType::DISCOVERY_RESPONSE) {
+                    // *** NEW: Handle RESPONSE messages ***
+                    if (payload.size() >= sizeof(DiscoveryPayload)) {
+                        DiscoveryPayload disc_payload;
+                        memcpy(&disc_payload, payload.data(), sizeof(disc_payload));
+                        
+                        string device_name = string(disc_payload.device_name);
+                        uint16_t tcp_port = ntohs(disc_payload.tcp_port);
+                        
+                        // Add peer to list
+                        Peer p;
+                        p.setName(device_name);
+                        p.setIP(sender_ip_str);
+                        p.setPort(tcp_port);
+                        p.setLastSeen(time(nullptr));
+                        p.setSelf(sender_ip_str == localIP);
+                        
+                        cfg.addOrUpdatePeer(p);
+                        
+                        // Uncomment for debugging
+                        // cout << "[Listener] Received response from " << device_name << "\n";
+                    }
+                }
+                else if (msg_type == MessageType::HEARTBEAT) {
+                    if (payload.size() >= sizeof(HeartbeatPayload)) {
+                        HeartbeatPayload hb_payload;
+                        memcpy(&hb_payload, payload.data(), sizeof(hb_payload));
+                        
+                        string device_name = string(hb_payload.device_name);
+                        
+                        Peer p;
+                        p.setName(device_name);
+                        p.setIP(sender_ip_str);
+                        p.setPort(5000);
+                        p.setLastSeen(time(nullptr));
+                        p.setSelf(sender_ip_str == localIP);
+                        
                         cfg.addOrUpdatePeer(p);
                     }
-                } catch (const exception& e) {
-                    // Ignore parse errors - might be from other software
                 }
+
             } else if (bytes == SOCKET_ERROR) {
-                // Timeout or error - check if we should continue
     #ifdef _WIN32
                 int err = WSAGetLastError();
                 if (err != WSAETIMEDOUT && err != WSAEWOULDBLOCK) {
-                    cerr << "Receive error: " << err << "\n";
                     break;
                 }
     #else
                 if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    cerr << "Receive error: " << strerror(errno) << "\n";
                     break;
                 }
     #endif
             }
-            // On timeout (bytes < 0), loop continues and checks running flag
         }
 
         closesocket(sock);
-        cleanupSockets();
+        cout << "[Listener] Stopped\n";
+    }
+
+    // Cleanup thread (same as before)
+    void cleanupLoop(Config& cfg, int timeout_sec) {
+        while (Discovery::isRunning()) {
+            long now = duration_cast<seconds>(
+                system_clock::now().time_since_epoch()
+            ).count();
+
+            cfg.removeStalePeers(now, timeout_sec);
+            cfg.save();
+
+            this_thread::sleep_for(seconds(10));
+        }
     }
 }
-
-void cleanupLoop(Config& cfg, int timeout_sec) {
-    while (Discovery::isRunning()) {
-        long now = duration_cast<seconds>(
-            system_clock::now().time_since_epoch()
-        ).count();
-
-        cfg.removeStalePeers(now, timeout_sec);
-        cfg.save();
-
-        this_thread::sleep_for(seconds(10));
-    }
-}
-
 
 void Discovery::start(Config& cfg, int discovery_port, int interval_sec, int timeout_sec) {
     if (running) return;
     running = true;
+    
+    cout << "=== Starting Discovery with Binary Protocol ===\n";
+    cout << "Magic Number: 0x" << hex << LANBOX_MAGIC << dec << "\n";
+    cout << "Protocol Version: " << PROTOCOL_VERSION << "\n";
+    cout << "Discovery Port: " << discovery_port << "\n\n";
+    
     senderThread = thread(senderLoop, ref(cfg), discovery_port, interval_sec);
     listenerThread = thread(listenerLoop, ref(cfg), discovery_port);
-    cleanupThread  = thread(cleanupLoop, ref(cfg), timeout_sec);
+    cleanupThread = thread(cleanupLoop, ref(cfg), timeout_sec);
 }
 
 void Discovery::stop() {

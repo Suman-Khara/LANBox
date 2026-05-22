@@ -24,4 +24,7 @@ public:
     vector<Peer> getPeers() const;
 
     void printPeers() const;
+
+    Peer* findPeer(const string& nameOrIP);
+    bool hasPeer(const string& nameOrIP) const;
 };

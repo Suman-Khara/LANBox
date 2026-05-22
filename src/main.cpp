@@ -299,11 +299,11 @@ int main(int argc, char* argv[]) {
         cout << "LANBox - LAN File Synchronization Tool\n";
         cout << "========================================\n";
         cout << "Usage:\n";
-        cout << "  lanbox server              - Start file receive server\n";
-        cout << "  lanbox send <ip> <file>    - Send file to peer\n";
-        cout << "  lanbox peers               - Show discovered peers\n";
-        cout << "  lanbox interfaces          - Show network interfaces\n";
-        cout << "  lanbox discover            - Start peer discovery\n";
+        cout << "  lanbox server                  - Start file receive server\n";
+        cout << "  lanbox send <peer> <file>      - Send file to peer (name or IP)\n";
+        cout << "  lanbox peers                   - Show discovered peers\n";
+        cout << "  lanbox interfaces              - Show network interfaces\n";
+        cout << "  lanbox discover                - Start peer discovery\n";
         return 1;
     }
 
@@ -322,7 +322,47 @@ int main(int argc, char* argv[]) {
     }
     
     if (mode == "send" && argc == 4) {
-        sendFile(argv[2], argv[3]);
+        string peerNameOrIP = argv[2];
+        string filename = argv[3];
+        
+        // Load config to check discovered peers
+        Config cfg;
+        cfg.load();
+        
+        string targetIP = peerNameOrIP;
+        
+        // Check if it's a peer name (not an IP address)
+        if (peerNameOrIP.find('.') == string::npos) {
+            // Looks like a name, not an IP - search in peers
+            Peer* peer = cfg.findPeer(peerNameOrIP);
+            
+            if (peer == nullptr) {
+                cerr << "Error: Peer '" << peerNameOrIP << "' not found in discovered peers.\n";
+                cerr << "Run 'lanbox peers' to see available peers.\n";
+                cerr << "Or run 'lanbox discover' to find peers on the network.\n";
+                return 1;
+            }
+            
+            if (peer->isSelf()) {
+                cerr << "Error: Cannot send file to yourself!\n";
+                return 1;
+            }
+            
+            targetIP = peer->getIP();
+            cout << "Resolved '" << peerNameOrIP << "' to " << targetIP << "\n";
+        } else {
+            // It's an IP address - check if we know this peer
+            if (cfg.hasPeer(targetIP)) {
+                Peer* peer = cfg.findPeer(targetIP);
+                cout << "Sending to known peer: " << peer->getName() 
+                     << " (" << targetIP << ")\n";
+            } else {
+                cout << "Warning: " << targetIP << " is not in discovered peers list.\n";
+                cout << "Attempting to send anyway...\n";
+            }
+        }
+        
+        sendFile(targetIP, filename);
         return 0;
     }
     
@@ -331,7 +371,6 @@ int main(int argc, char* argv[]) {
     cfg.load();
     
     if (mode == "discover") {
-        // Setup signal handler BEFORE starting discovery
         signal(SIGINT, handleSignal);
         signal(SIGTERM, handleSignal);
         
@@ -340,18 +379,16 @@ int main(int argc, char* argv[]) {
         
         Discovery::start(cfg);
         
-        // Keep running and display peers periodically
         int counter = 0;
         while (g_running) {
             this_thread::sleep_for(chrono::seconds(1));
             
-            if (++counter % 5 == 0) {  // Every 5 seconds
+            if (++counter % 5 == 0) {
                 cout << "\r=== Discovered Peers (refresh #" << counter/5 << ") ===\n";
                 cfg.printPeers();
                 cfg.save();
                 cout << "\n";
             } else {
-                // Show simple status
                 auto peers = cfg.getPeers();
                 size_t active_count = 0;
                 for (const auto& p : peers) {
@@ -375,7 +412,14 @@ int main(int argc, char* argv[]) {
     
     if (mode == "peers") {
         cout << "=== Current Peers (from saved config) ===\n";
-        cfg.printPeers();
+        if (cfg.getPeers().empty()) {
+            cout << "No peers discovered yet.\n";
+            cout << "Run 'lanbox discover' to find peers on the network.\n";
+        } else {
+            cfg.printPeers();
+            cout << "\nYou can send files using peer names:\n";
+            cout << "Example: lanbox send <peer_name> <filename>\n";
+        }
         return 0;
     }
     
