@@ -3,6 +3,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <openssl/sha.h>
 
 using namespace std;
 
@@ -45,13 +46,16 @@ struct __attribute__((packed)) LANBoxHeader {
 // Verify size at compile time
 static_assert(sizeof(LANBoxHeader) == HEADER_SIZE, "Header size must be 32 bytes");
 
-// Discovery request payload
+// Discovery request/response payload
 struct __attribute__((packed)) DiscoveryPayload {
     char device_name[64];        // Hostname (64 bytes)
     uint16_t tcp_port;           // Port for file transfers (2 bytes)
     uint16_t capabilities;       // Feature flags (2 bytes)
+    char public_key_hash[32];    // SHA256 of public key (32 bytes)
+    uint32_t public_key_length;  // Length of public key (4 bytes)
+    // Public key itself sent in extended payload after this struct
     uint32_t reserved;           // For future use (4 bytes)
-    // Total: 72 bytes
+    // Total: 108 bytes (was 72 before)
 };
 
 // Heartbeat payload
@@ -73,7 +77,8 @@ public:
         const string& device_name,
         uint32_t sender_ip,
         uint16_t tcp_port,
-        uint32_t sequence
+        uint32_t sequence,
+        const string& public_key = ""  // Default empty for backward compatibility
     );
     
     // Create a heartbeat message

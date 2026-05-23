@@ -112,7 +112,6 @@ vector<Peer> Config::getPeers() const {
 void Config::printPeers() const {
     cout << "Peers:\n";
     for (const auto& p : peers) {
-        // Convert last_seen to readable datetime
         time_t ts = static_cast<time_t>(p.getLastSeen());
         tm* tm_info = localtime(&ts);
 
@@ -122,11 +121,15 @@ void Config::printPeers() const {
         if (p.isSelf()) {
             cout << " (self)";
         }
+        
+        if (p.hasPublicKey()) {
+            cout << " [Key: " << p.getFingerprint().substr(0, 8) << "...]";
+        } else {
+            cout << " [No Key]";
+        }
 
         if (tm_info) {
             cout << " last seen: " << put_time(tm_info, "%Y-%m-%d %H:%M:%S");
-        } else {
-            cout << " last seen: (invalid time)";
         }
 
         cout << "\n";

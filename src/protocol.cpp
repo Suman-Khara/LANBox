@@ -109,7 +109,8 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     const string& device_name,
     uint32_t sender_ip,
     uint16_t tcp_port,
-    uint32_t sequence
+    uint32_t sequence,
+    const string& public_key  // NEW parameter
 ) {
     // Create header
     LANBoxHeader header;
@@ -130,15 +131,25 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     payload.tcp_port = htons(tcp_port);
     payload.capabilities = htons(0x0001);  // Basic capability
     
-    header.payload_length = htonl(sizeof(payload));
+    // Calculate SHA256 hash of public key
+    unsigned char hash[32];
+    SHA256((unsigned char*)public_key.c_str(), public_key.length(), hash);
+    memcpy(payload.public_key_hash, hash, 32);
+    
+    payload.public_key_length = htonl(public_key.length());
+    
+    // Calculate total payload size (struct + actual public key)
+    uint32_t total_payload_size = sizeof(payload) + public_key.length();
+    header.payload_length = htonl(total_payload_size);
     
     // Combine into single buffer
-    vector<uint8_t> message(sizeof(header) + sizeof(payload));
+    vector<uint8_t> message(sizeof(header) + total_payload_size);
     memcpy(message.data(), &header, sizeof(header));
     memcpy(message.data() + sizeof(header), &payload, sizeof(payload));
+    memcpy(message.data() + sizeof(header) + sizeof(payload), 
+           public_key.c_str(), public_key.length());
     
-    // Calculate checksum (excluding checksum field itself)
-    // Set checksum to 0 first
+    // Calculate checksum
     LANBoxHeader* header_ptr = (LANBoxHeader*)message.data();
     header_ptr->checksum = 0;
     

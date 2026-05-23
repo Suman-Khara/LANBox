@@ -6,7 +6,9 @@ void to_json(json& j, const Peer& p) {
         {"ip", p.getIP()},
         {"port", p.getPort()},
         {"last_seen", p.getLastSeen()},
-        {"self", p.isSelf()}
+        {"self", p.isSelf()},
+        {"public_key", p.getPublicKey()},     
+        {"fingerprint", p.getFingerprint()}   
     };
 }
 
@@ -16,4 +18,6 @@ void from_json(const json& j, Peer& p) {
     p.setPort(j.value("port", 5000));
     p.setLastSeen(j.value("last_seen", 0L));
     p.setSelf(j.value("self", false));
+    p.setPublicKey(j.value("public_key", ""));   
+    p.setFingerprint(j.value("fingerprint", ""));
 }

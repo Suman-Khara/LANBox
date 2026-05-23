@@ -1,12 +1,12 @@
 #include "discovery.hpp"
 #include "protocol.hpp"
 #include "network_interface.hpp"
+#include "crypto.hpp"
 #include <bits/stdc++.h>
 #include <chrono>
 #include <set>
 
 #ifdef _WIN32
-    #define WIN32_LEAN_AND_MEAN
     #define _HAS_STD_BYTE 0
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -169,27 +169,35 @@ namespace {
         string hostname = getHostName();
         string localIP = getLocalIP();
         uint32_t sender_ip = Protocol::ipToUint32(localIP);
+        
+        // NEW: Load public key
+        string publicKey;
+        try {
+            publicKey = Crypto::loadPublicKey();
+            cout << "[Sender] Loaded public key (fingerprint: " 
+                << Crypto::getPublicKeyFingerprint() << ")\n";
+        } catch (const exception& e) {
+            cerr << "[Sender] Warning: No public key found. Run 'lanbox keygen' first.\n";
+            cerr << "[Sender] Continuing without encryption...\n";
+        }
 
         cout << "[Sender] Broadcasting as " << hostname << " (" << localIP << ")\n";
 
         while (Discovery::isRunning()) {
-            // Create binary discovery message
+            // Create binary discovery message with public key
             vector<uint8_t> message = Protocol::createDiscoveryRequest(
                 hostname,
                 sender_ip,
-                5000,  // TCP port for file transfer
-                g_sequence_number++
+                5000,
+                g_sequence_number++,
+                publicKey  // NEW: Include public key
             );
 
-            // Send the binary message
             int sent = sendto(sock, (char*)message.data(), message.size(), 0, 
                             (sockaddr*)&broadcastAddr, sizeof(broadcastAddr));
             
             if (sent < 0) {
                 cerr << "[Sender] Send failed\n";
-            } else {
-                // Uncomment for debugging
-                // cout << "[Sender] Sent " << sent << " bytes (binary protocol)\n";
             }
 
             this_thread::sleep_for(seconds(interval_sec));
@@ -277,24 +285,61 @@ namespace {
                         
                         string device_name = string(disc_payload.device_name);
                         uint16_t tcp_port = ntohs(disc_payload.tcp_port);
+                        uint32_t pub_key_len = ntohl(disc_payload.public_key_length);
                         
-                        // Add peer to list
+                        // NEW: Extract public key if present
+                        string peer_public_key;
+                        string peer_fingerprint;
+                        
+                        if (pub_key_len > 0 && payload.size() >= sizeof(DiscoveryPayload) + pub_key_len) {
+                            // Public key starts after the DiscoveryPayload struct
+                            peer_public_key = string(
+                                (char*)(payload.data() + sizeof(DiscoveryPayload)),
+                                pub_key_len
+                            );
+                            
+                            // Calculate fingerprint
+                            unsigned char hash[32];
+                            SHA256((unsigned char*)peer_public_key.c_str(), 
+                                peer_public_key.length(), hash);
+                            
+                            char fingerprint[33];
+                            for (int i = 0; i < 16; i++) {
+                                sprintf(fingerprint + (i * 2), "%02x", hash[i]);
+                            }
+                            fingerprint[32] = '\0';
+                            peer_fingerprint = string(fingerprint);
+                            
+                            cout << "[Listener] Received public key from " << device_name 
+                                << " (fingerprint: " << peer_fingerprint << ")\n";
+                        }
+                        
                         Peer p;
                         p.setName(device_name);
                         p.setIP(sender_ip_str);
                         p.setPort(tcp_port);
                         p.setLastSeen(time(nullptr));
                         p.setSelf(sender_ip_str == localIP);
+                        p.setPublicKey(peer_public_key);      // NEW
+                        p.setFingerprint(peer_fingerprint);    // NEW
                         
                         cfg.addOrUpdatePeer(p);
                         
-                        // *** NEW: Send RESPONSE back to sender ***
-                        if (sender_ip_str != localIP) {  // Don't respond to ourselves
+                        // Send response with OUR public key
+                        if (sender_ip_str != localIP) {
+                            string our_public_key;
+                            try {
+                                our_public_key = Crypto::loadPublicKey();
+                            } catch (...) {
+                                // No key, send without it
+                            }
+                            
                             vector<uint8_t> response = Protocol::createDiscoveryRequest(
                                 hostname,
                                 local_ip_uint,
                                 5000,
-                                g_sequence_number++
+                                g_sequence_number++,
+                                our_public_key  // NEW: Include our public key
                             );
                             
                             // Change message type to RESPONSE
@@ -306,36 +351,59 @@ namespace {
                             uint32_t crc = Protocol::calculateCRC32(response.data(), response.size());
                             resp_header->checksum = htonl(crc);
                             
-                            // Send directly to sender (unicast, not broadcast)
                             sendto(sock, (char*)response.data(), response.size(), 0,
                                 (sockaddr*)&senderAddr, senderLen);
-                            
-                            // Uncomment for debugging
-                            // cout << "[Listener] Sent response to " << device_name << "\n";
                         }
                     }
                 } 
                 else if (msg_type == MessageType::DISCOVERY_RESPONSE) {
-                    // *** NEW: Handle RESPONSE messages ***
+                    // *** Handle RESPONSE messages ***
                     if (payload.size() >= sizeof(DiscoveryPayload)) {
                         DiscoveryPayload disc_payload;
                         memcpy(&disc_payload, payload.data(), sizeof(disc_payload));
                         
                         string device_name = string(disc_payload.device_name);
                         uint16_t tcp_port = ntohs(disc_payload.tcp_port);
+                        uint32_t pub_key_len = ntohl(disc_payload.public_key_length);
                         
-                        // Add peer to list
+                        // NEW: Extract public key if present
+                        string peer_public_key;
+                        string peer_fingerprint;
+                        
+                        if (pub_key_len > 0 && payload.size() >= sizeof(DiscoveryPayload) + pub_key_len) {
+                            // Public key starts after the DiscoveryPayload struct
+                            peer_public_key = string(
+                                (char*)(payload.data() + sizeof(DiscoveryPayload)),
+                                pub_key_len
+                            );
+                            
+                            // Calculate fingerprint
+                            unsigned char hash[32];
+                            SHA256((unsigned char*)peer_public_key.c_str(), 
+                                peer_public_key.length(), hash);
+                            
+                            char fingerprint[33];
+                            for (int i = 0; i < 16; i++) {
+                                sprintf(fingerprint + (i * 2), "%02x", hash[i]);
+                            }
+                            fingerprint[32] = '\0';
+                            peer_fingerprint = string(fingerprint);
+                            
+                            cout << "[Listener] Received response with public key from " << device_name 
+                                << " (fingerprint: " << peer_fingerprint << ")\n";
+                        }
+                        
+                        // Create/update peer with public key
                         Peer p;
                         p.setName(device_name);
                         p.setIP(sender_ip_str);
                         p.setPort(tcp_port);
                         p.setLastSeen(time(nullptr));
                         p.setSelf(sender_ip_str == localIP);
+                        p.setPublicKey(peer_public_key);      // Store public key
+                        p.setFingerprint(peer_fingerprint);    // Store fingerprint
                         
                         cfg.addOrUpdatePeer(p);
-                        
-                        // Uncomment for debugging
-                        // cout << "[Listener] Received response from " << device_name << "\n";
                     }
                 }
                 else if (msg_type == MessageType::HEARTBEAT) {

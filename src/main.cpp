@@ -4,6 +4,7 @@
 #include "config.hpp"
 #include "discovery.hpp"
 #include "peer.hpp"
+#include "crypto.hpp"
 #include "network_interface.hpp"
 #include <chrono>
 #include <csignal>
@@ -26,7 +27,6 @@ void handleSignal(int) {
 }
 
 #ifdef _WIN32
-    #define WIN32_LEAN_AND_MEAN
     #define _HAS_STD_BYTE 0  // prevent conflict with byte
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -295,6 +295,10 @@ void sendFile(const string &server_ip, const string &filename) {
 }
 
 int main(int argc, char* argv[]) {
+    #ifdef _WIN32
+        // Enable UTF-8 output on Windows
+        SetConsoleOutputCP(CP_UTF8);
+    #endif
     if (argc < 2) {
         cout << "LANBox - LAN File Synchronization Tool\n";
         cout << "========================================\n";
@@ -304,11 +308,39 @@ int main(int argc, char* argv[]) {
         cout << "  lanbox peers                   - Show discovered peers\n";
         cout << "  lanbox interfaces              - Show network interfaces\n";
         cout << "  lanbox discover                - Start peer discovery\n";
+        cout << "  lanbox keygen                  - Generate RSA key pair\n";
         return 1;
     }
 
     string mode = argv[1];
-    
+    if (mode == "keygen") {
+        cout << "=== LANBox Key Generation ===\n\n";
+        
+        if (Crypto::keysExist()) {
+            cout << "Keys already exist!\n";
+            cout << "Current fingerprint: " << Crypto::getPublicKeyFingerprint() << "\n\n";
+            cout << "Do you want to regenerate? This will create NEW keys. (y/n): ";
+            
+            char response;
+            cin >> response;
+            
+            if (response != 'y' && response != 'Y') {
+                cout << "Keeping existing keys.\n";
+                return 0;
+            }
+        }
+        
+        if (Crypto::generateKeyPair(2048)) {
+            cout << "\n✓ Success!\n";
+            cout << "Your device fingerprint: " << Crypto::getPublicKeyFingerprint() << "\n";
+            cout << "\nThis fingerprint uniquely identifies your device.\n";
+            return 0;
+        } else {
+            cerr << "Key generation failed.\n";
+            return 1;
+        }
+    }
+
     // Commands that DON'T need discovery running
     if (mode == "interfaces") {
         auto interfaces = NetworkInterfaceManager::getActiveInterfaces();
