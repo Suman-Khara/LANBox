@@ -1,4 +1,5 @@
 #include "protocol.hpp"
+#include "crypto.hpp"
 #include <sstream>
 #include <iostream>
 #include <ctime>
@@ -110,7 +111,7 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     uint32_t sender_ip,
     uint16_t tcp_port,
     uint32_t sequence,
-    const string& public_key  // NEW parameter
+    const string& public_key
 ) {
     // Create header
     LANBoxHeader header;
@@ -129,7 +130,7 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     
     strncpy(payload.device_name, device_name.c_str(), sizeof(payload.device_name) - 1);
     payload.tcp_port = htons(tcp_port);
-    payload.capabilities = htons(0x0001);  // Basic capability
+    payload.capabilities = htons(0x0001);
     
     // Calculate SHA256 hash of public key
     unsigned char hash[32];
@@ -138,16 +139,45 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     
     payload.public_key_length = htonl(public_key.length());
     
-    // Calculate total payload size (struct + actual public key)
-    uint32_t total_payload_size = sizeof(payload) + public_key.length();
+    // NEW: Create message to sign (device_name + ip + timestamp + public_key)
+    string message_to_sign = device_name + 
+                            to_string(sender_ip) + 
+                            to_string(ntohll(header.timestamp)) + 
+                            public_key;
+    
+    vector<unsigned char> signature;
+    try {
+        signature = Crypto::signMessage(message_to_sign);
+        payload.signature_length = htonl(signature.size());
+    } catch (const exception& e) {
+        // No private key available - send without signature
+        payload.signature_length = 0;
+    }
+    
+    // Calculate total payload size (struct + public_key + signature)
+    uint32_t total_payload_size = sizeof(payload) + public_key.length() + signature.size();
     header.payload_length = htonl(total_payload_size);
     
     // Combine into single buffer
     vector<uint8_t> message(sizeof(header) + total_payload_size);
-    memcpy(message.data(), &header, sizeof(header));
-    memcpy(message.data() + sizeof(header), &payload, sizeof(payload));
-    memcpy(message.data() + sizeof(header) + sizeof(payload), 
-           public_key.c_str(), public_key.length());
+    size_t offset = 0;
+    
+    // Copy header
+    memcpy(message.data() + offset, &header, sizeof(header));
+    offset += sizeof(header);
+    
+    // Copy payload struct
+    memcpy(message.data() + offset, &payload, sizeof(payload));
+    offset += sizeof(payload);
+    
+    // Copy public key
+    memcpy(message.data() + offset, public_key.c_str(), public_key.length());
+    offset += public_key.length();
+    
+    // Copy signature
+    if (!signature.empty()) {
+        memcpy(message.data() + offset, signature.data(), signature.size());
+    }
     
     // Calculate checksum
     LANBoxHeader* header_ptr = (LANBoxHeader*)message.data();

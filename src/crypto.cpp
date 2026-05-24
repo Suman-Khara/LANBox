@@ -3,6 +3,8 @@
 #include <fstream>
 #include <filesystem>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
 
 // OpenSSL includes
 #include <openssl/rsa.h>
@@ -175,4 +177,127 @@ string Crypto::getPublicKeyFingerprint() {
     } catch (const exception& e) {
         return "NO_KEY";
     }
+}
+
+vector<unsigned char> Crypto::signMessage(const string& message) {
+    // Load private key
+    FILE* file = fopen(privKeyFile.c_str(), "rb");
+    if (!file) {
+        throw runtime_error("Private key not found. Run 'lanbox keygen' first.");
+    }
+    
+    EVP_PKEY* pkey = PEM_read_PrivateKey(file, nullptr, nullptr, nullptr);
+    fclose(file);
+    
+    if (!pkey) {
+        throw runtime_error("Failed to read private key");
+    }
+    
+    // Create signing context
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx) {
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to create signing context");
+    }
+    
+    // Initialize signing
+    if (EVP_DigestSignInit(md_ctx, nullptr, EVP_sha256(), nullptr, pkey) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to initialize signing");
+    }
+    
+    // Update with message data
+    if (EVP_DigestSignUpdate(md_ctx, message.c_str(), message.length()) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to update signing");
+    }
+    
+    // Get signature length
+    size_t sig_len = 0;
+    if (EVP_DigestSignFinal(md_ctx, nullptr, &sig_len) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to get signature length");
+    }
+    
+    // Get actual signature
+    vector<unsigned char> signature(sig_len);
+    if (EVP_DigestSignFinal(md_ctx, signature.data(), &sig_len) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to create signature");
+    }
+    
+    signature.resize(sig_len);
+    
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(pkey);
+    
+    return signature;
+}
+
+bool Crypto::verifySignature(const string& message, 
+                            const vector<unsigned char>& signature,
+                            const string& public_key_pem) {
+    // Parse public key from PEM string
+    BIO* bio = BIO_new_mem_buf(public_key_pem.c_str(), public_key_pem.length());
+    if (!bio) {
+        return false;
+    }
+    
+    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    
+    if (!pkey) {
+        return false;
+    }
+    
+    // Create verification context
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (!md_ctx) {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    
+    // Initialize verification
+    if (EVP_DigestVerifyInit(md_ctx, nullptr, EVP_sha256(), nullptr, pkey) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    
+    // Update with message data
+    if (EVP_DigestVerifyUpdate(md_ctx, message.c_str(), message.length()) <= 0) {
+        EVP_MD_CTX_free(md_ctx);
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+    
+    // Verify signature
+    int result = EVP_DigestVerifyFinal(md_ctx, signature.data(), signature.size());
+    
+    EVP_MD_CTX_free(md_ctx);
+    EVP_PKEY_free(pkey);
+    
+    return (result == 1);
+}
+
+string Crypto::toHex(const vector<unsigned char>& data) {
+    ostringstream oss;
+    for (unsigned char byte : data) {
+        oss << hex << setfill('0') << setw(2) << (int)byte;
+    }
+    return oss.str();
+}
+
+vector<unsigned char> Crypto::fromHex(const string& hex) {
+    vector<unsigned char> data;
+    for (size_t i = 0; i < hex.length(); i += 2) {
+        string byteStr = hex.substr(i, 2);
+        unsigned char byte = (unsigned char)strtol(byteStr.c_str(), nullptr, 16);
+        data.push_back(byte);
+    }
+    return data;
 }

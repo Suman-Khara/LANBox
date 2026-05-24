@@ -22,6 +22,18 @@
     inline void closesocket(SocketType s) { close(s); }
 #endif
 
+// Platform-specific byte order conversions for 64-bit
+#ifndef htonll
+    #ifdef _WIN32
+        #define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
+        #define ntohll(x) ((1==ntohl(1)) ? (x) : ((uint64_t)ntohl((x) & 0xFFFFFFFF) << 32) | ntohl((x) >> 32))
+    #else
+        #include <endian.h>
+        #define htonll(x) htobe64(x)
+        #define ntohll(x) be64toh(x)
+    #endif
+#endif
+
 using namespace std;
 using namespace chrono;
 
@@ -286,8 +298,9 @@ namespace {
                         string device_name = string(disc_payload.device_name);
                         uint16_t tcp_port = ntohs(disc_payload.tcp_port);
                         uint32_t pub_key_len = ntohl(disc_payload.public_key_length);
+                        uint32_t sig_len = ntohl(disc_payload.signature_length);
                         
-                        // NEW: Extract public key if present
+                        // Extract public key
                         string peer_public_key;
                         string peer_fingerprint;
                         
@@ -309,9 +322,42 @@ namespace {
                             }
                             fingerprint[32] = '\0';
                             peer_fingerprint = string(fingerprint);
+                        }
+                        
+                        // NEW: Extract and verify signature
+                        bool signature_valid = false;
+                        if (sig_len > 0 && payload.size() >= sizeof(DiscoveryPayload) + pub_key_len + sig_len) {
+                            // Extract signature
+                            vector<unsigned char> signature(
+                                payload.data() + sizeof(DiscoveryPayload) + pub_key_len,
+                                payload.data() + sizeof(DiscoveryPayload) + pub_key_len + sig_len
+                            );
                             
-                            cout << "[Listener] Received public key from " << device_name 
-                                << " (fingerprint: " << peer_fingerprint << ")\n";
+                            // Reconstruct the signed message
+                            uint32_t sender_ip_uint = ntohl(header.sender_ip);
+                            uint64_t timestamp = ntohll(header.timestamp);
+                            string message_to_verify = device_name + 
+                                                    to_string(sender_ip_uint) + 
+                                                    to_string(timestamp) + 
+                                                    peer_public_key;
+                            
+                            // Verify signature
+                            try {
+                                signature_valid = Crypto::verifySignature(message_to_verify, signature, peer_public_key);
+                                
+                                if (signature_valid) {
+                                    cout << "[Listener] ✓ Signature VALID from " << device_name << "\n";
+                                } else {
+                                    cerr << "[Listener] ✗ Signature INVALID from " << device_name << " - REJECTING\n";
+                                    continue;  // Reject this peer!
+                                }
+                            } catch (const exception& e) {
+                                cerr << "[Listener] Signature verification failed: " << e.what() << "\n";
+                                continue;  // Reject on error
+                            }
+                        } else if (pub_key_len > 0) {
+                            // Has public key but no signature - warn but accept for now
+                            cout << "[Listener] Warning: " << device_name << " sent no signature (old version?)\n";
                         }
                         
                         Peer p;

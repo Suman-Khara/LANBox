@@ -29,6 +29,13 @@ public:
     static void ensureKeyDir();
     static string getKeyDir() { return keyDir; }
     
-    // Encryption/Decryption (will add in Step 3.4)
-    // Signing/Verification (will add in Step 3.3)
+    // NEW: Digital signatures
+    static vector<unsigned char> signMessage(const string& message);
+    static bool verifySignature(const string& message, 
+                               const vector<unsigned char>& signature,
+                               const string& public_key_pem);
+    
+    // Helper: Convert binary to hex string
+    static string toHex(const vector<unsigned char>& data);
+    static vector<unsigned char> fromHex(const string& hex);
 };

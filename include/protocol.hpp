@@ -53,9 +53,12 @@ struct __attribute__((packed)) DiscoveryPayload {
     uint16_t capabilities;       // Feature flags (2 bytes)
     char public_key_hash[32];    // SHA256 of public key (32 bytes)
     uint32_t public_key_length;  // Length of public key (4 bytes)
-    // Public key itself sent in extended payload after this struct
+    uint32_t signature_length;   // NEW: Length of digital signature (4 bytes)
     uint32_t reserved;           // For future use (4 bytes)
-    // Total: 108 bytes (was 72 before)
+    // After this struct in the payload:
+    // 1. Public key (public_key_length bytes)
+    // 2. Digital signature (signature_length bytes)
+    // Total struct: 112 bytes
 };
 
 // Heartbeat payload
