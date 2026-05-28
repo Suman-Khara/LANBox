@@ -8,6 +8,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # Fix Windows byte conflict globally
 if (WIN32)
     add_compile_definitions(_HAS_STD_BYTE=0 WIN32_LEAN_AND_MEAN NOMINMAX)
+else()
+    # Linux also needs this for OpenSSL + C++17
+    add_compile_definitions(_HAS_STD_BYTE=0)
 endif()
 
 include_directories(include)
@@ -22,7 +25,7 @@ if (WIN32)
     # OpenSSL paths for Windows
     set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
     set(OPENSSL_INCLUDE_DIR "${OPENSSL_ROOT_DIR}/include")
-    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")  # MT = Static
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
     
     target_include_directories(lanbox PRIVATE ${OPENSSL_INCLUDE_DIR})
     target_link_libraries(lanbox PRIVATE 
@@ -30,7 +33,7 @@ if (WIN32)
         "${OPENSSL_LIB_DIR}/libcrypto.lib"
         ws2_32
         iphlpapi
-        crypt32  # Needed for static OpenSSL
+        crypt32
     )
 else()
     target_link_libraries(lanbox PRIVATE pthread ssl crypto)

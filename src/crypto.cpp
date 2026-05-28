@@ -12,6 +12,7 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/rand.h>
 
 using namespace std;
 
@@ -300,4 +301,325 @@ vector<unsigned char> Crypto::fromHex(const string& hex) {
         data.push_back(byte);
     }
     return data;
+}
+
+// ============================================================================
+// AES ENCRYPTION/DECRYPTION
+// ============================================================================
+
+vector<unsigned char> Crypto::generateAESKey(int bits) {
+    int bytes = bits / 8;  // 256 bits = 32 bytes
+    vector<unsigned char> key(bytes);
+    
+    // Generate random bytes
+    if (RAND_bytes(key.data(), bytes) != 1) {
+        throw runtime_error("Failed to generate random AES key");
+    }
+    
+    return key;
+}
+
+vector<unsigned char> Crypto::generateIV() {
+    // AES block size is always 128 bits (16 bytes)
+    vector<unsigned char> iv(16);
+    
+    if (RAND_bytes(iv.data(), 16) != 1) {
+        throw runtime_error("Failed to generate random IV");
+    }
+    
+    return iv;
+}
+
+bool Crypto::encryptFileAES(const string& input_file,
+                           const string& output_file,
+                           const vector<unsigned char>& aes_key,
+                           const vector<unsigned char>& iv) {
+    // Open input file
+    ifstream infile(input_file, ios::binary);
+    if (!infile.is_open()) {
+        cerr << "Cannot open input file: " << input_file << "\n";
+        return false;
+    }
+    
+    // Open output file
+    ofstream outfile(output_file, ios::binary);
+    if (!outfile.is_open()) {
+        cerr << "Cannot open output file: " << output_file << "\n";
+        return false;
+    }
+    
+    // Create encryption context
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return false;
+    }
+    
+    // Initialize encryption (AES-256-CBC)
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, aes_key.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    // Encrypt file in chunks
+    const int BUFFER_SIZE = 64 * 1024;  // 64KB chunks
+    vector<unsigned char> inbuf(BUFFER_SIZE);
+    vector<unsigned char> outbuf(BUFFER_SIZE + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    
+    while (infile.read((char*)inbuf.data(), BUFFER_SIZE) || infile.gcount() > 0) {
+        int bytes_read = infile.gcount();
+        int outlen = 0;
+        
+        if (EVP_EncryptUpdate(ctx, outbuf.data(), &outlen, inbuf.data(), bytes_read) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+        
+        outfile.write((char*)outbuf.data(), outlen);
+    }
+    
+    // Finalize encryption (handles padding)
+    int final_len = 0;
+    if (EVP_EncryptFinal_ex(ctx, outbuf.data(), &final_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    if (final_len > 0) {
+        outfile.write((char*)outbuf.data(), final_len);
+    }
+    
+    EVP_CIPHER_CTX_free(ctx);
+    infile.close();
+    outfile.close();
+    
+    return true;
+}
+
+bool Crypto::decryptFileAES(const string& input_file,
+                           const string& output_file,
+                           const vector<unsigned char>& aes_key,
+                           const vector<unsigned char>& iv) {
+    // Open encrypted file
+    ifstream infile(input_file, ios::binary);
+    if (!infile.is_open()) {
+        cerr << "Cannot open encrypted file: " << input_file << "\n";
+        return false;
+    }
+    
+    // Open output file
+    ofstream outfile(output_file, ios::binary);
+    if (!outfile.is_open()) {
+        cerr << "Cannot open output file: " << output_file << "\n";
+        return false;
+    }
+    
+    // Create decryption context
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        return false;
+    }
+    
+    // Initialize decryption
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), nullptr, aes_key.data(), iv.data()) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    // Decrypt file in chunks
+    const int BUFFER_SIZE = 64 * 1024;
+    vector<unsigned char> inbuf(BUFFER_SIZE);
+    vector<unsigned char> outbuf(BUFFER_SIZE + EVP_CIPHER_block_size(EVP_aes_256_cbc()));
+    
+    while (infile.read((char*)inbuf.data(), BUFFER_SIZE) || infile.gcount() > 0) {
+        int bytes_read = infile.gcount();
+        int outlen = 0;
+        
+        if (EVP_DecryptUpdate(ctx, outbuf.data(), &outlen, inbuf.data(), bytes_read) != 1) {
+            EVP_CIPHER_CTX_free(ctx);
+            return false;
+        }
+        
+        outfile.write((char*)outbuf.data(), outlen);
+    }
+    
+    // Finalize decryption
+    int final_len = 0;
+    if (EVP_DecryptFinal_ex(ctx, outbuf.data(), &final_len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return false;
+    }
+    
+    if (final_len > 0) {
+        outfile.write((char*)outbuf.data(), final_len);
+    }
+    
+    EVP_CIPHER_CTX_free(ctx);
+    infile.close();
+    outfile.close();
+    
+    return true;
+}
+
+// ============================================================================
+// RSA ENCRYPTION/DECRYPTION (for encrypting AES keys)
+// ============================================================================
+
+vector<unsigned char> Crypto::encryptRSA(const vector<unsigned char>& data,
+                                        const string& public_key_pem) {
+    // Parse public key
+    BIO* bio = BIO_new_mem_buf(public_key_pem.c_str(), public_key_pem.length());
+    if (!bio) {
+        throw runtime_error("Failed to create BIO for public key");
+    }
+    
+    EVP_PKEY* pkey = PEM_read_bio_PUBKEY(bio, nullptr, nullptr, nullptr);
+    BIO_free(bio);
+    
+    if (!pkey) {
+        throw runtime_error("Failed to read public key");
+    }
+    
+    // Create encryption context
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to create encryption context");
+    }
+    
+    if (EVP_PKEY_encrypt_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to initialize encryption");
+    }
+    
+    // Set padding
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to set padding");
+    }
+    
+    // Get output size
+    size_t outlen;
+    if (EVP_PKEY_encrypt(ctx, nullptr, &outlen, data.data(), data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to determine output size");
+    }
+    
+    // Encrypt
+    vector<unsigned char> encrypted(outlen);
+    if (EVP_PKEY_encrypt(ctx, encrypted.data(), &outlen, data.data(), data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("RSA encryption failed");
+    }
+    
+    encrypted.resize(outlen);
+    
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    
+    return encrypted;
+}
+
+vector<unsigned char> Crypto::decryptRSA(const vector<unsigned char>& encrypted_data) {
+    // Load private key
+    FILE* file = fopen(privKeyFile.c_str(), "rb");
+    if (!file) {
+        throw runtime_error("Private key not found");
+    }
+    
+    EVP_PKEY* pkey = PEM_read_PrivateKey(file, nullptr, nullptr, nullptr);
+    fclose(file);
+    
+    if (!pkey) {
+        throw runtime_error("Failed to read private key");
+    }
+    
+    // Create decryption context
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx) {
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to create decryption context");
+    }
+    
+    if (EVP_PKEY_decrypt_init(ctx) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to initialize decryption");
+    }
+    
+    // Set padding
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to set padding");
+    }
+    
+    // Get output size
+    size_t outlen;
+    if (EVP_PKEY_decrypt(ctx, nullptr, &outlen, encrypted_data.data(), encrypted_data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("Failed to determine output size");
+    }
+    
+    // Decrypt
+    vector<unsigned char> decrypted(outlen);
+    if (EVP_PKEY_decrypt(ctx, decrypted.data(), &outlen, encrypted_data.data(), encrypted_data.size()) <= 0) {
+        EVP_PKEY_CTX_free(ctx);
+        EVP_PKEY_free(pkey);
+        throw runtime_error("RSA decryption failed");
+    }
+    
+    decrypted.resize(outlen);
+    
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
+    
+    return decrypted;
+}
+
+// ============================================================================
+// HYBRID ENCRYPTION (Convenience functions)
+// ============================================================================
+
+Crypto::EncryptedFileInfo Crypto::encryptFile(const string& input_file,
+                                              const string& output_file,
+                                              const string& recipient_public_key) {
+    EncryptedFileInfo info;
+    
+    // Step 1: Generate random AES key and IV
+    vector<unsigned char> aes_key = generateAESKey(256);
+    vector<unsigned char> iv = generateIV();
+    
+    // Step 2: Encrypt file with AES
+    if (!encryptFileAES(input_file, output_file, aes_key, iv)) {
+        throw runtime_error("AES file encryption failed");
+    }
+    
+    // Step 3: Encrypt AES key with recipient's RSA public key
+    info.encrypted_aes_key = encryptRSA(aes_key, recipient_public_key);
+    info.iv = iv;
+    info.encrypted_file_path = output_file;
+    
+    return info;
+}
+
+bool Crypto::decryptFile(const string& encrypted_file,
+                        const string& output_file,
+                        const vector<unsigned char>& encrypted_aes_key,
+                        const vector<unsigned char>& iv) {
+    try {
+        // Step 1: Decrypt AES key using our private key
+        vector<unsigned char> aes_key = decryptRSA(encrypted_aes_key);
+        
+        // Step 2: Decrypt file using AES key
+        return decryptFileAES(encrypted_file, output_file, aes_key, iv);
+        
+    } catch (const exception& e) {
+        cerr << "Decryption failed: " << e.what() << "\n";
+        return false;
+    }
 }
