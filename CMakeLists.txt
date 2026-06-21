@@ -91,3 +91,27 @@ if (WIN32)
 else()
     target_link_libraries(test_step3 PRIVATE ssl crypto pthread)
 endif()
+
+add_executable(test_step4a
+    src/test_step4a.cpp
+    src/sync_manager.cpp
+    src/folder_watcher.cpp
+    src/group_manager.cpp
+    src/config.cpp
+    src/peer.cpp
+    src/crypto.cpp
+    src/protocol.cpp)
+target_include_directories(test_step4a PRIVATE include)
+
+if (WIN32)
+    target_compile_definitions(test_step4a PRIVATE _HAS_STD_BYTE=0 WIN32_LEAN_AND_MEAN NOMINMAX)
+    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
+    target_include_directories(test_step4a PRIVATE "${OPENSSL_ROOT_DIR}/include")
+    target_link_libraries(test_step4a PRIVATE
+        "${OPENSSL_LIB_DIR}/libssl.lib"
+        "${OPENSSL_LIB_DIR}/libcrypto.lib"
+        ws2_32 iphlpapi crypt32)
+else()
+    target_link_libraries(test_step4a PRIVATE ssl crypto pthread)
+endif()
