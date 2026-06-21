@@ -22,6 +22,7 @@ Thumbs.db
 # Generated config/data
 /data/lanbox.json
 /keys/
+/src/test_step*.cpp
 
 #output files
 output.txt

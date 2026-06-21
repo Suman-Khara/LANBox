@@ -10,7 +10,6 @@
     #include <winsock2.h>
     #include <ws2tcpip.h>
     #pragma comment(lib, "ws2_32.lib")
-    // Windows doesn't have htonll, define it
     #ifndef htonll
         #define htonll(x) ((1==htonl(1)) ? (x) : ((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
         #define ntohll(x) ((1==ntohl(1)) ? (x) : ((uint64_t)ntohl((x) & 0xFFFFFFFF) << 32) | ntohl((x) >> 32))
@@ -18,7 +17,6 @@
 #else
     #include <arpa/inet.h>
     #include <netinet/in.h>
-    // Linux might not have htonll either
     #ifndef htonll
         #define htonll(x) htobe64(x)
         #define ntohll(x) be64toh(x)
@@ -27,7 +25,10 @@
 
 using namespace std;
 
-// CRC32 lookup table (for fast calculation)
+// ============================================================================
+// CRC32 lookup table (unchanged)
+// ============================================================================
+
 static const uint32_t crc32_table[256] = {
     0x00000000, 0x77073096, 0xee0e612c, 0x990951ba,
     0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
@@ -95,16 +96,60 @@ static const uint32_t crc32_table[256] = {
     0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d
 };
 
+// ============================================================================
+// CRC32 (unchanged)
+// ============================================================================
+
 uint32_t Protocol::calculateCRC32(const uint8_t* data, size_t length) {
-    uint32_t crc = 0xFFFFFFFF;  // Initial value
-    
+    uint32_t crc = 0xFFFFFFFF;
     for (size_t i = 0; i < length; i++) {
         uint8_t index = (crc ^ data[i]) & 0xFF;
         crc = (crc >> 8) ^ crc32_table[index];
     }
-    
-    return crc ^ 0xFFFFFFFF;  // Final XOR
+    return crc ^ 0xFFFFFFFF;
 }
+
+// ============================================================================
+// Internal helper — wraps any payload in a header and computes CRC.
+// All Phase 4 builders delegate to this after preparing their payload buffer.
+// ============================================================================
+
+vector<uint8_t> Protocol::buildMessage(
+    MessageType type,
+    uint32_t sender_ip,
+    uint32_t sequence,
+    const uint8_t* payload,
+    size_t payload_size
+) {
+    LANBoxHeader header;
+    memset(&header, 0, sizeof(header));
+
+    header.magic          = htonl(LANBOX_MAGIC);
+    header.version        = htons(PROTOCOL_VERSION);
+    header.message_type   = htons(static_cast<uint16_t>(type));
+    header.sequence_number = htonl(sequence);
+    header.timestamp      = htonll(static_cast<uint64_t>(time(nullptr)));
+    header.sender_ip      = htonl(sender_ip);
+    header.payload_length = htonl(static_cast<uint32_t>(payload_size));
+    header.checksum       = 0;  // filled below
+
+    vector<uint8_t> message(sizeof(header) + payload_size);
+    memcpy(message.data(), &header, sizeof(header));
+    if (payload_size > 0 && payload != nullptr) {
+        memcpy(message.data() + sizeof(header), payload, payload_size);
+    }
+
+    // Compute CRC over the whole message (checksum field is still 0)
+    uint32_t crc = calculateCRC32(message.data(), message.size());
+    LANBoxHeader* hptr = reinterpret_cast<LANBoxHeader*>(message.data());
+    hptr->checksum = htonl(crc);
+
+    return message;
+}
+
+// ============================================================================
+// Existing builders (unchanged)
+// ============================================================================
 
 vector<uint8_t> Protocol::createDiscoveryRequest(
     const string& device_name,
@@ -113,79 +158,59 @@ vector<uint8_t> Protocol::createDiscoveryRequest(
     uint32_t sequence,
     const string& public_key
 ) {
-    // Create header
     LANBoxHeader header;
     memset(&header, 0, sizeof(header));
-    
-    header.magic = htonl(LANBOX_MAGIC);
-    header.version = htons(PROTOCOL_VERSION);
-    header.message_type = htons(static_cast<uint16_t>(MessageType::DISCOVERY_REQUEST));
+
+    header.magic          = htonl(LANBOX_MAGIC);
+    header.version        = htons(PROTOCOL_VERSION);
+    header.message_type   = htons(static_cast<uint16_t>(MessageType::DISCOVERY_REQUEST));
     header.sequence_number = htonl(sequence);
-    header.timestamp = htonll(time(nullptr));
-    header.sender_ip = htonl(sender_ip);
-    
-    // Create payload
+    header.timestamp      = htonll(time(nullptr));
+    header.sender_ip      = htonl(sender_ip);
+
     DiscoveryPayload payload;
     memset(&payload, 0, sizeof(payload));
-    
+
     strncpy(payload.device_name, device_name.c_str(), sizeof(payload.device_name) - 1);
-    payload.tcp_port = htons(tcp_port);
+    payload.tcp_port     = htons(tcp_port);
     payload.capabilities = htons(0x0001);
-    
-    // Calculate SHA256 hash of public key
+
     unsigned char hash[32];
     SHA256((unsigned char*)public_key.c_str(), public_key.length(), hash);
     memcpy(payload.public_key_hash, hash, 32);
-    
     payload.public_key_length = htonl(public_key.length());
-    
-    // NEW: Create message to sign (device_name + ip + timestamp + public_key)
-    string message_to_sign = device_name + 
-                            to_string(sender_ip) + 
-                            to_string(ntohll(header.timestamp)) + 
-                            public_key;
-    
+
+    string message_to_sign = device_name +
+                             to_string(sender_ip) +
+                             to_string(ntohll(header.timestamp)) +
+                             public_key;
+
     vector<unsigned char> signature;
     try {
         signature = Crypto::signMessage(message_to_sign);
         payload.signature_length = htonl(signature.size());
-    } catch (const exception& e) {
-        // No private key available - send without signature
+    } catch (const exception&) {
         payload.signature_length = 0;
     }
-    
-    // Calculate total payload size (struct + public_key + signature)
-    uint32_t total_payload_size = sizeof(payload) + public_key.length() + signature.size();
-    header.payload_length = htonl(total_payload_size);
-    
-    // Combine into single buffer
-    vector<uint8_t> message(sizeof(header) + total_payload_size);
+
+    uint32_t total_payload = sizeof(payload) + public_key.length() + signature.size();
+    header.payload_length = htonl(total_payload);
+
+    vector<uint8_t> message(sizeof(header) + total_payload);
     size_t offset = 0;
-    
-    // Copy header
-    memcpy(message.data() + offset, &header, sizeof(header));
-    offset += sizeof(header);
-    
-    // Copy payload struct
-    memcpy(message.data() + offset, &payload, sizeof(payload));
-    offset += sizeof(payload);
-    
-    // Copy public key
+    memcpy(message.data() + offset, &header, sizeof(header));     offset += sizeof(header);
+    memcpy(message.data() + offset, &payload, sizeof(payload));   offset += sizeof(payload);
     memcpy(message.data() + offset, public_key.c_str(), public_key.length());
     offset += public_key.length();
-    
-    // Copy signature
     if (!signature.empty()) {
         memcpy(message.data() + offset, signature.data(), signature.size());
     }
-    
-    // Calculate checksum
-    LANBoxHeader* header_ptr = (LANBoxHeader*)message.data();
-    header_ptr->checksum = 0;
-    
+
+    LANBoxHeader* hptr = (LANBoxHeader*)message.data();
+    hptr->checksum = 0;
     uint32_t crc = calculateCRC32(message.data(), message.size());
-    header_ptr->checksum = htonl(crc);
-    
+    hptr->checksum = htonl(crc);
+
     return message;
 }
 
@@ -195,35 +220,13 @@ vector<uint8_t> Protocol::createHeartbeat(
     uint32_t uptime_seconds,
     uint32_t sequence
 ) {
-    LANBoxHeader header;
-    memset(&header, 0, sizeof(header));
-    
-    header.magic = htonl(LANBOX_MAGIC);
-    header.version = htons(PROTOCOL_VERSION);
-    header.message_type = htons(static_cast<uint16_t>(MessageType::HEARTBEAT));
-    header.sequence_number = htonl(sequence);
-    header.timestamp = htonll(time(nullptr));
-    header.sender_ip = htonl(sender_ip);
-    
     HeartbeatPayload payload;
     memset(&payload, 0, sizeof(payload));
-    
     strncpy(payload.device_name, device_name.c_str(), sizeof(payload.device_name) - 1);
     payload.uptime_seconds = htonl(uptime_seconds);
-    
-    header.payload_length = htonl(sizeof(payload));
-    
-    vector<uint8_t> message(sizeof(header) + sizeof(payload));
-    memcpy(message.data(), &header, sizeof(header));
-    memcpy(message.data() + sizeof(header), &payload, sizeof(payload));
-    
-    LANBoxHeader* header_ptr = (LANBoxHeader*)message.data();
-    header_ptr->checksum = 0;
-    
-    uint32_t crc = calculateCRC32(message.data(), message.size());
-    header_ptr->checksum = htonl(crc);
-    
-    return message;
+
+    return buildMessage(MessageType::HEARTBEAT, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&payload), sizeof(payload));
 }
 
 bool Protocol::parseMessage(
@@ -232,54 +235,38 @@ bool Protocol::parseMessage(
     LANBoxHeader& header,
     vector<uint8_t>& payload
 ) {
-    // Check minimum size
     if (length < sizeof(LANBoxHeader)) {
         cerr << "Message too short\n";
         return false;
     }
-    
-    // Copy header
     memcpy(&header, data, sizeof(header));
-    
-    // Validate magic number
     if (ntohl(header.magic) != LANBOX_MAGIC) {
         cerr << "Invalid magic number\n";
         return false;
     }
-    
-    // Extract payload
     uint32_t payload_len = ntohl(header.payload_length);
     if (length < sizeof(LANBoxHeader) + payload_len) {
         cerr << "Incomplete message\n";
         return false;
     }
-    
     payload.resize(payload_len);
     if (payload_len > 0) {
         memcpy(payload.data(), data + sizeof(LANBoxHeader), payload_len);
     }
-    
     return true;
 }
 
 bool Protocol::validateMessage(const uint8_t* data, size_t length) {
-    if (length < sizeof(LANBoxHeader)) {
-        return false;
-    }
-    
-    // Extract checksum
+    if (length < sizeof(LANBoxHeader)) return false;
+
     LANBoxHeader header;
     memcpy(&header, data, sizeof(header));
     uint32_t received_crc = ntohl(header.checksum);
-    
-    // Create copy and zero out checksum field
+
     vector<uint8_t> temp(data, data + length);
-    LANBoxHeader* temp_header = (LANBoxHeader*)temp.data();
-    temp_header->checksum = 0;
-    
-    // Calculate CRC
+    reinterpret_cast<LANBoxHeader*>(temp.data())->checksum = 0;
     uint32_t calculated_crc = calculateCRC32(temp.data(), temp.size());
-    
+
     return (received_crc == calculated_crc);
 }
 
@@ -288,12 +275,10 @@ uint32_t Protocol::ipToUint32(const string& ip) {
     istringstream iss(ip);
     string octet;
     int shift = 24;
-    
     while (getline(iss, octet, '.') && shift >= 0) {
         result |= (stoi(octet) << shift);
         shift -= 8;
     }
-    
     return result;
 }
 
@@ -301,21 +286,239 @@ string Protocol::uint32ToIp(uint32_t ip) {
     ostringstream oss;
     oss << ((ip >> 24) & 0xFF) << "."
         << ((ip >> 16) & 0xFF) << "."
-        << ((ip >> 8) & 0xFF) << "."
-        << (ip & 0xFF);
+        << ((ip >>  8) & 0xFF) << "."
+        << ( ip        & 0xFF);
     return oss.str();
 }
 
 string Protocol::messageTypeToString(MessageType type) {
     switch (type) {
-        case MessageType::DISCOVERY_REQUEST:  return "DISCOVERY_REQUEST";
-        case MessageType::DISCOVERY_RESPONSE: return "DISCOVERY_RESPONSE";
-        case MessageType::HEARTBEAT:          return "HEARTBEAT";
-        case MessageType::FILE_TRANSFER_REQ:  return "FILE_TRANSFER_REQ";
-        case MessageType::FILE_CHUNK:         return "FILE_CHUNK";
-        case MessageType::FILE_ACK:           return "FILE_ACK";
-        case MessageType::PEER_INFO_REQUEST:  return "PEER_INFO_REQUEST";
-        case MessageType::PEER_INFO_RESPONSE: return "PEER_INFO_RESPONSE";
-        default: return "UNKNOWN";
+        // Existing
+        case MessageType::DISCOVERY_REQUEST:   return "DISCOVERY_REQUEST";
+        case MessageType::DISCOVERY_RESPONSE:  return "DISCOVERY_RESPONSE";
+        case MessageType::HEARTBEAT:           return "HEARTBEAT";
+        case MessageType::FILE_TRANSFER_REQ:   return "FILE_TRANSFER_REQ";
+        case MessageType::FILE_CHUNK:          return "FILE_CHUNK";
+        case MessageType::FILE_ACK:            return "FILE_ACK";
+        case MessageType::PEER_INFO_REQUEST:   return "PEER_INFO_REQUEST";
+        case MessageType::PEER_INFO_RESPONSE:  return "PEER_INFO_RESPONSE";
+        // Phase 4 — sync
+        case MessageType::SYNC_NOTIFY:         return "SYNC_NOTIFY";
+        case MessageType::SYNC_REQUEST:        return "SYNC_REQUEST";
+        case MessageType::SYNC_OFFER:          return "SYNC_OFFER";
+        case MessageType::SYNC_OFFER_ACCEPT:   return "SYNC_OFFER_ACCEPT";
+        case MessageType::SYNC_DECLINE:        return "SYNC_DECLINE";
+        case MessageType::SYNC_DELETE_NOTIFY:  return "SYNC_DELETE_NOTIFY";
+        case MessageType::SYNC_RENAME_NOTIFY:  return "SYNC_RENAME_NOTIFY";
+        case MessageType::SYNC_META_REQUEST:   return "SYNC_META_REQUEST";
+        case MessageType::SYNC_META_DELTA:     return "SYNC_META_DELTA";
+        case MessageType::SYNC_PAUSE_NOTIFY:   return "SYNC_PAUSE_NOTIFY";
+        case MessageType::SYNC_PAUSE_ACK:      return "SYNC_PAUSE_ACK";
+        case MessageType::SYNC_RESUME_NOTIFY:  return "SYNC_RESUME_NOTIFY";
+        // Phase 4 — group management
+        case MessageType::GROUP_INVITE:        return "GROUP_INVITE";
+        case MessageType::GROUP_INVITE_ACK:    return "GROUP_INVITE_ACK";
+        case MessageType::GROUP_JOIN_REQUEST:  return "GROUP_JOIN_REQUEST";
+        case MessageType::GROUP_JOIN_APPROVE:  return "GROUP_JOIN_APPROVE";
+        case MessageType::GROUP_JOIN_DENY:     return "GROUP_JOIN_DENY";
+        case MessageType::GROUP_KICK:          return "GROUP_KICK";
+        default:                               return "UNKNOWN";
     }
+}
+
+// ============================================================================
+// Phase 4 message builders
+// ============================================================================
+// For fixed-size payloads: byte-swap all integer fields, call buildMessage.
+// For variable payloads: build a buffer = fixed struct + variable section,
+// set the length field in the struct, then call buildMessage on the buffer.
+// ============================================================================
+
+// Helper: byte-swap a SyncNotifyPayload (all integers to network order)
+static void htonSyncNotify(SyncNotifyPayload& p) {
+    p.version   = htonl(p.version);
+    p.file_size = htonll(p.file_size);
+    // char arrays need no swapping
+}
+
+vector<uint8_t> Protocol::createSyncNotify(
+    uint32_t sender_ip, uint32_t sequence, const SyncNotifyPayload& p
+) {
+    SyncNotifyPayload net = p;
+    htonSyncNotify(net);
+    return buildMessage(MessageType::SYNC_NOTIFY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncRequest(
+    uint32_t sender_ip, uint32_t sequence, const SyncRequestPayload& p
+) {
+    SyncRequestPayload net = p;
+    net.have_version = htonl(net.have_version);
+    net.need_version = htonl(net.need_version);
+    return buildMessage(MessageType::SYNC_REQUEST, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncOffer(
+    uint32_t sender_ip, uint32_t sequence, const SyncOfferPayload& p
+) {
+    SyncOfferPayload net = p;
+    net.version          = htonl(net.version);
+    net.sender_tcp_port  = htons(net.sender_tcp_port);
+    return buildMessage(MessageType::SYNC_OFFER, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncOfferAccept(
+    uint32_t sender_ip, uint32_t sequence, const SyncOfferAcceptPayload& p
+) {
+    SyncOfferAcceptPayload net = p;
+    net.version = htonl(net.version);
+    return buildMessage(MessageType::SYNC_OFFER_ACCEPT, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncDecline(
+    uint32_t sender_ip, uint32_t sequence, const SyncDeclinePayload& p
+) {
+    SyncDeclinePayload net = p;
+    net.version = htonl(net.version);
+    return buildMessage(MessageType::SYNC_DECLINE, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncDeleteNotify(
+    uint32_t sender_ip, uint32_t sequence, const SyncDeletePayload& p
+) {
+    SyncDeletePayload net = p;
+    net.deleted_at          = htonll(net.deleted_at);
+    net.version_at_deletion = htonl(net.version_at_deletion);
+    return buildMessage(MessageType::SYNC_DELETE_NOTIFY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncRenameNotify(
+    uint32_t sender_ip, uint32_t sequence, const SyncRenamePayload& p
+) {
+    SyncRenamePayload net = p;
+    net.new_version = htonl(net.new_version);
+    net.renamed_at  = htonll(net.renamed_at);
+    return buildMessage(MessageType::SYNC_RENAME_NOTIFY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&net), sizeof(net));
+}
+
+vector<uint8_t> Protocol::createSyncMetaRequest(
+    uint32_t sender_ip, uint32_t sequence, const SyncMetaRequestPayload& p
+) {
+    // No integers to swap in this struct
+    return buildMessage(MessageType::SYNC_META_REQUEST, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createSyncMetaDelta(
+    uint32_t sender_ip, uint32_t sequence,
+    const SyncMetaDeltaPayload& fixed, const string& json_data
+) {
+    // Build: fixed struct (with json_length in network order) + json bytes
+    SyncMetaDeltaPayload net = fixed;
+    net.json_length = htonl(static_cast<uint32_t>(json_data.size()));
+
+    size_t total = sizeof(net) + json_data.size();
+    vector<uint8_t> buf(total);
+    memcpy(buf.data(), &net, sizeof(net));
+    memcpy(buf.data() + sizeof(net), json_data.data(), json_data.size());
+
+    return buildMessage(MessageType::SYNC_META_DELTA, sender_ip, sequence,
+                        buf.data(), buf.size());
+}
+
+vector<uint8_t> Protocol::createSyncPauseNotify(
+    uint32_t sender_ip, uint32_t sequence, const SyncPauseNotifyPayload& p
+) {
+    return buildMessage(MessageType::SYNC_PAUSE_NOTIFY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createSyncPauseAck(
+    uint32_t sender_ip, uint32_t sequence, const SyncPauseAckPayload& p
+) {
+    return buildMessage(MessageType::SYNC_PAUSE_ACK, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createSyncResumeNotify(
+    uint32_t sender_ip, uint32_t sequence, const SyncResumeNotifyPayload& p
+) {
+    return buildMessage(MessageType::SYNC_RESUME_NOTIFY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createGroupInvite(
+    uint32_t sender_ip, uint32_t sequence,
+    const GroupInvitePayload& fixed, const string& group_json
+) {
+    GroupInvitePayload net = fixed;
+    net.group_json_length = htonl(static_cast<uint32_t>(group_json.size()));
+
+    size_t total = sizeof(net) + group_json.size();
+    vector<uint8_t> buf(total);
+    memcpy(buf.data(), &net, sizeof(net));
+    memcpy(buf.data() + sizeof(net), group_json.data(), group_json.size());
+
+    return buildMessage(MessageType::GROUP_INVITE, sender_ip, sequence,
+                        buf.data(), buf.size());
+}
+
+vector<uint8_t> Protocol::createGroupInviteAck(
+    uint32_t sender_ip, uint32_t sequence, const GroupInviteAckPayload& p
+) {
+    return buildMessage(MessageType::GROUP_INVITE_ACK, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createGroupJoinRequest(
+    uint32_t sender_ip, uint32_t sequence,
+    const GroupJoinRequestPayload& fixed, const string& pubkey_pem
+) {
+    GroupJoinRequestPayload net = fixed;
+    net.pubkey_length = htonl(static_cast<uint32_t>(pubkey_pem.size()));
+
+    size_t total = sizeof(net) + pubkey_pem.size();
+    vector<uint8_t> buf(total);
+    memcpy(buf.data(), &net, sizeof(net));
+    memcpy(buf.data() + sizeof(net), pubkey_pem.data(), pubkey_pem.size());
+
+    return buildMessage(MessageType::GROUP_JOIN_REQUEST, sender_ip, sequence,
+                        buf.data(), buf.size());
+}
+
+vector<uint8_t> Protocol::createGroupJoinApprove(
+    uint32_t sender_ip, uint32_t sequence,
+    const GroupJoinApprovePayload& fixed, const string& group_json
+) {
+    GroupJoinApprovePayload net = fixed;
+    net.group_json_length = htonl(static_cast<uint32_t>(group_json.size()));
+
+    size_t total = sizeof(net) + group_json.size();
+    vector<uint8_t> buf(total);
+    memcpy(buf.data(), &net, sizeof(net));
+    memcpy(buf.data() + sizeof(net), group_json.data(), group_json.size());
+
+    return buildMessage(MessageType::GROUP_JOIN_APPROVE, sender_ip, sequence,
+                        buf.data(), buf.size());
+}
+
+vector<uint8_t> Protocol::createGroupJoinDeny(
+    uint32_t sender_ip, uint32_t sequence, const GroupJoinDenyPayload& p
+) {
+    return buildMessage(MessageType::GROUP_JOIN_DENY, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
+}
+
+vector<uint8_t> Protocol::createGroupKick(
+    uint32_t sender_ip, uint32_t sequence, const GroupKickPayload& p
+) {
+    return buildMessage(MessageType::GROUP_KICK, sender_ip, sequence,
+                        reinterpret_cast<const uint8_t*>(&p), sizeof(p));
 }

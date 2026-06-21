@@ -38,3 +38,56 @@ if (WIN32)
 else()
     target_link_libraries(lanbox PRIVATE pthread ssl crypto)
 endif()
+
+add_executable(test_step1 src/test_step1.cpp src/protocol.cpp src/crypto.cpp)
+target_include_directories(test_step1 PRIVATE include)
+
+if (WIN32)
+    target_compile_definitions(test_step1 PRIVATE _HAS_STD_BYTE=0 WIN32_LEAN_AND_MEAN NOMINMAX)
+    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
+    target_include_directories(test_step1 PRIVATE "${OPENSSL_ROOT_DIR}/include")
+    target_link_libraries(test_step1 PRIVATE
+        "${OPENSSL_LIB_DIR}/libssl.lib"
+        "${OPENSSL_LIB_DIR}/libcrypto.lib"
+        ws2_32 iphlpapi crypt32)
+else()
+    target_link_libraries(test_step1 PRIVATE ssl crypto pthread)
+endif()
+
+add_executable(test_step2
+    src/test_step2.cpp
+    src/group_manager.cpp)
+target_include_directories(test_step2 PRIVATE include)
+
+if (WIN32)
+    target_compile_definitions(test_step2 PRIVATE _HAS_STD_BYTE=0 WIN32_LEAN_AND_MEAN NOMINMAX)
+    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
+    target_include_directories(test_step2 PRIVATE "${OPENSSL_ROOT_DIR}/include")
+    target_link_libraries(test_step2 PRIVATE
+        "${OPENSSL_LIB_DIR}/libssl.lib"
+        "${OPENSSL_LIB_DIR}/libcrypto.lib"
+        ws2_32 iphlpapi crypt32)
+else()
+    target_link_libraries(test_step2 PRIVATE ssl crypto pthread)
+endif()
+
+add_executable(test_step3
+    src/test_step3.cpp
+    src/folder_watcher.cpp
+    src/group_manager.cpp)
+target_include_directories(test_step3 PRIVATE include)
+
+if (WIN32)
+    target_compile_definitions(test_step3 PRIVATE _HAS_STD_BYTE=0 WIN32_LEAN_AND_MEAN NOMINMAX)
+    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    set(OPENSSL_LIB_DIR "${OPENSSL_ROOT_DIR}/lib/VC/x64/MT")
+    target_include_directories(test_step3 PRIVATE "${OPENSSL_ROOT_DIR}/include")
+    target_link_libraries(test_step3 PRIVATE
+        "${OPENSSL_LIB_DIR}/libssl.lib"
+        "${OPENSSL_LIB_DIR}/libcrypto.lib"
+        ws2_32 iphlpapi crypt32)
+else()
+    target_link_libraries(test_step3 PRIVATE ssl crypto pthread)
+endif()
