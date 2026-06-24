@@ -11,9 +11,12 @@
 #include "group_manager.hpp"
 #include "folder_watcher.hpp"
 #include "json.hpp"
+#include "protocol.hpp"
 
 using json = nlohmann::json;
 using namespace std;
+
+const uint16_t SYNC_SIGNALING_PORT = 5003;
 
 // ============================================================================
 // Sync engine state
@@ -167,4 +170,34 @@ private:
     // ── Network identity (cached from cfg_/Crypto at startup) ─────────────────
     string          device_name_;
     uint32_t        local_ip_ = 0;
+
+// ── Signaling socket (UDP :5003) ───────────────────────────────────────
+    SocketType signaling_socket_ = INVALID_SOCKET_VAL;
+    bool initSignalingSocket();
+    void closeSignalingSocket();
+
+    // Dispatch an incoming parsed message to the correct handler
+    void dispatchSyncMessage(const LANBoxHeader& header,
+                             const vector<uint8_t>& payload,
+                             const string& sender_ip);
+
+    // ── Handler stubs (full bodies arrive in Steps 4e–4l) ───────────────────
+    void onSyncNotify       (const SyncNotifyPayload& p, const string& sender_ip);
+    void onSyncRequest      (const SyncRequestPayload& p, const string& sender_ip);
+    void onSyncOffer        (const SyncOfferPayload& p, const string& sender_ip);
+    void onSyncOfferAccept  (const SyncOfferAcceptPayload& p, const string& sender_ip);
+    void onSyncDecline      (const SyncDeclinePayload& p, const string& sender_ip);
+    void onSyncDeleteNotify (const SyncDeletePayload& p, const string& sender_ip);
+    void onSyncRenameNotify (const SyncRenamePayload& p, const string& sender_ip);
+    void onSyncMetaRequest  (const SyncMetaRequestPayload& p, const string& sender_ip);
+    void onSyncMetaDelta    (const SyncMetaDeltaPayload& fixed, const string& json_data, const string& sender_ip);
+    void onSyncPauseNotify  (const SyncPauseNotifyPayload& p, const string& sender_ip);
+    void onSyncPauseAck     (const SyncPauseAckPayload& p, const string& sender_ip);
+    void onSyncResumeNotify (const SyncResumeNotifyPayload& p, const string& sender_ip);
+    void onGroupInvite      (const GroupInvitePayload& fixed, const string& group_json, const string& sender_ip);
+    void onGroupInviteAck   (const GroupInviteAckPayload& p, const string& sender_ip);
+    void onGroupJoinRequest (const GroupJoinRequestPayload& fixed, const string& pubkey_pem, const string& sender_ip);
+    void onGroupJoinApprove (const GroupJoinApprovePayload& fixed, const string& group_json, const string& sender_ip);
+    void onGroupJoinDeny    (const GroupJoinDenyPayload& p, const string& sender_ip);
+    void onGroupKick        (const GroupKickPayload& p, const string& sender_ip);
 };
