@@ -3,6 +3,7 @@
 #include "crypto.hpp"
 #include "protocol.hpp"
 #include <bits/stdc++.h>
+#include <fstream>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -21,6 +22,10 @@
         #define htonll(x) htobe64(x)
         #define ntohll(x) be64toh(x)
     #endif
+#endif
+
+#ifndef _WIN32
+    #include <sys/select.h>
 #endif
 
 using namespace std;
@@ -706,11 +711,417 @@ void SyncManager::onGroupKick(const GroupKickPayload& p, const string& sender_ip
     logSync("[DISPATCH] GROUP_KICK from " + sender_ip);
 }
 
-void SyncManager::transferLoop() {
-    // Persistent TCP server for incoming sync transfers — Step 4c+
-    while (!stop_requested_.load()) {
-        this_thread::sleep_for(chrono::milliseconds(200));
+// ============================================================================
+// Transfer socket setup
+// ============================================================================
+
+bool SyncManager::initTransferSocket() {
+    transfer_listen_socket_ = socket(AF_INET, SOCK_STREAM, 0);
+    if (transfer_listen_socket_ == INVALID_SOCKET_VAL) {
+        cerr << "[SyncManager] Failed to create transfer socket\n";
+        return false;
     }
+
+    int reuse = 1;
+    setsockopt(transfer_listen_socket_, SOL_SOCKET, SO_REUSEADDR,
+              (const char*)&reuse, sizeof(reuse));
+
+    sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(SYNC_TRANSFER_PORT);
+
+    if (bind(transfer_listen_socket_, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        cerr << "[SyncManager] Failed to bind transfer socket on port "
+             << SYNC_TRANSFER_PORT << "\n";
+        closesocket(transfer_listen_socket_);
+        transfer_listen_socket_ = INVALID_SOCKET_VAL;
+        return false;
+    }
+
+    if (listen(transfer_listen_socket_, 16) < 0) {
+        cerr << "[SyncManager] Failed to listen on transfer socket\n";
+        closesocket(transfer_listen_socket_);
+        transfer_listen_socket_ = INVALID_SOCKET_VAL;
+        return false;
+    }
+
+    // No SO_RCVTIMEO here — accept() timeout is handled via select() in
+    // transferLoop() instead, since SO_RCVTIMEO on a listening socket's
+    // accept() is unreliable on Windows.
+
+    return true;
+}
+
+void SyncManager::closeTransferSocket() {
+    if (transfer_listen_socket_ != INVALID_SOCKET_VAL) {
+        closesocket(transfer_listen_socket_);
+        transfer_listen_socket_ = INVALID_SOCKET_VAL;
+    }
+}
+
+void SyncManager::reapFinishedTransferThreads() {
+    lock_guard<mutex> lock(transfer_threads_mutex_);
+    // We can't easily check "is this thread done" without joining, and
+    // joining blocks. Since each handler thread is short-lived and detached
+    // logically (we don't need their return value), we just join everything
+    // accumulated so far whenever this is called from a safe point (stop).
+    // During normal operation the vector simply grows; cleanup happens at
+    // stopDaemon(). This avoids needing a more complex thread-pool here.
+}
+
+// ============================================================================
+// Transfer loop — accept() loop, dispatches each connection to its own thread
+// ============================================================================
+
+void SyncManager::transferLoop() {
+    if (!initTransferSocket()) {
+        cerr << "[SyncManager] Transfer loop could not start — socket init failed\n";
+        return;
+    }
+
+    logSync("[STARTUP] Transfer loop listening on TCP :" +
+            to_string(SYNC_TRANSFER_PORT));
+
+    while (!stop_requested_.load()) {
+        // Use select() to wait up to 200ms for an incoming connection.
+        // This gives reliable, cross-platform timeout behavior, unlike
+        // SO_RCVTIMEO applied to accept() on Windows.
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(transfer_listen_socket_, &read_fds);
+
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 200000; // 200ms
+
+        int sel = select((int)transfer_listen_socket_ + 1, &read_fds, nullptr, nullptr, &tv);
+
+        if (sel <= 0) {
+            // Timeout (sel == 0) or error (sel < 0) — loop back and
+            // check stop_requested_.
+            continue;
+        }
+
+        if (!FD_ISSET(transfer_listen_socket_, &read_fds)) {
+            continue;
+        }
+
+        sockaddr_in client_addr;
+        memset(&client_addr, 0, sizeof(client_addr));
+#ifdef _WIN32
+        int addr_len = sizeof(client_addr);
+#else
+        socklen_t addr_len = sizeof(client_addr);
+#endif
+
+        SocketType client_sock = accept(transfer_listen_socket_,
+                                        (sockaddr*)&client_addr, &addr_len);
+
+        if (client_sock == INVALID_SOCKET_VAL) {
+            continue; // spurious wakeup or error, try again
+        }
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
+        string client_ip(ip_str);
+
+        {
+            lock_guard<mutex> lock(transfer_threads_mutex_);
+            transfer_threads_.emplace_back(
+                &SyncManager::handleIncomingConnection, this, client_sock, client_ip);
+        }
+    }
+
+    closeTransferSocket();
+
+    {
+        lock_guard<mutex> lock(transfer_threads_mutex_);
+        for (auto& t : transfer_threads_) {
+            if (t.joinable()) t.join();
+        }
+        transfer_threads_.clear();
+    }
+}
+
+// ============================================================================
+// Per-connection dispatch — reads SyncTransferHeader, branches on type
+// ============================================================================
+
+void SyncManager::handleIncomingConnection(SocketType client_sock, string client_ip) {
+    SyncTransferHeader header;
+    memset(&header, 0, sizeof(header));
+
+    int received = 0;
+    while (received < (int)sizeof(header)) {
+        int n = recv(client_sock,
+                    reinterpret_cast<char*>(&header) + received,
+                    (int)sizeof(header) - received, 0);
+        if (n <= 0) {
+            // Connection closed before header arrived — nothing to do
+            closesocket(client_sock);
+            return;
+        }
+        received += n;
+    }
+
+    if (header.transfer_type == 0) {
+        receiveLegacyTransfer(client_sock, client_ip);
+    } else if (header.transfer_type == 1) {
+        string group_id(header.group_id, strnlen(header.group_id, sizeof(header.group_id)));
+        string rel_path(header.relative_path,
+                        strnlen(header.relative_path, sizeof(header.relative_path)));
+        receiveGroupSyncTransfer(client_sock, group_id, rel_path, client_ip);
+    } else {
+        cerr << "[SyncManager] Unknown transfer_type " << (int)header.transfer_type
+             << " from " << client_ip << " — closing connection\n";
+        closesocket(client_sock);
+    }
+}
+
+// ============================================================================
+// Legacy transfer path (transfer_type == 0)
+// Adapted from the original single-shot receiveFile() in main.cpp, now
+// running per-connection inside the persistent server.
+// ============================================================================
+
+void SyncManager::receiveLegacyTransfer(SocketType client_sock, const string& client_ip) {
+    auto recvAll = [&](void* buf, size_t len) -> bool {
+        size_t got = 0;
+        while (got < len) {
+            int n = recv(client_sock, (char*)buf + got, (int)(len - got), 0);
+            if (n <= 0) return false;
+            got += n;
+        }
+        return true;
+    };
+
+    uint32_t nameLenNet;
+    if (!recvAll(&nameLenNet, sizeof(nameLenNet))) { closesocket(client_sock); return; }
+    uint32_t nameLen = ntohl(nameLenNet);
+    if (nameLen == 0 || nameLen > 4096) { closesocket(client_sock); return; }
+
+    string filename(nameLen, '\0');
+    if (!recvAll(&filename[0], nameLen)) { closesocket(client_sock); return; }
+
+    uint64_t sizeNet;
+    if (!recvAll(&sizeNet, sizeof(sizeNet))) { closesocket(client_sock); return; }
+#if defined(_WIN32)
+    uint64_t fileSize = _byteswap_uint64(sizeNet);
+#else
+    uint64_t fileSize = be64toh(sizeNet);
+#endif
+
+    uint8_t is_encrypted;
+    if (!recvAll(&is_encrypted, sizeof(is_encrypted))) { closesocket(client_sock); return; }
+
+    vector<unsigned char> encrypted_aes_key;
+    vector<unsigned char> iv;
+
+    if (is_encrypted) {
+        uint32_t key_len_net;
+        if (!recvAll(&key_len_net, sizeof(key_len_net))) { closesocket(client_sock); return; }
+        uint32_t key_len = ntohl(key_len_net);
+        if (key_len == 0 || key_len > 4096) { closesocket(client_sock); return; }
+
+        encrypted_aes_key.resize(key_len);
+        if (!recvAll(encrypted_aes_key.data(), key_len)) { closesocket(client_sock); return; }
+
+        iv.resize(16);
+        if (!recvAll(iv.data(), 16)) { closesocket(client_sock); return; }
+    }
+
+    logSync("[LEGACY] Receiving '" + filename + "' (" + to_string(fileSize) +
+           " bytes) from " + client_ip + (is_encrypted ? " [encrypted]" : ""));
+
+    string temp_file = is_encrypted
+                       ? filename.substr(0, filename.find_last_of('.')) + "_temp_enc" +
+                         (filename.find_last_of('.') != string::npos
+                          ? filename.substr(filename.find_last_of('.')) : "")
+                       : filename;
+
+    ofstream outfile(temp_file, ios::binary);
+    if (!outfile.is_open()) {
+        cerr << "[SyncManager] Cannot open output file: " << temp_file << "\n";
+        closesocket(client_sock);
+        return;
+    }
+
+    vector<char> buffer(TRANSFER_BUFFER_SIZE);
+    uint64_t received_bytes = 0;
+
+    while (received_bytes < fileSize) {
+        int n = recv(client_sock, buffer.data(),
+                    (int)min((uint64_t)TRANSFER_BUFFER_SIZE, fileSize - received_bytes), 0);
+        if (n <= 0) break;
+        outfile.write(buffer.data(), n);
+        received_bytes += n;
+    }
+    outfile.close();
+    closesocket(client_sock);
+
+    if (received_bytes != fileSize) {
+        logSync("[LEGACY] Transfer incomplete for '" + filename + "' from " +
+                client_ip + " (" + to_string(received_bytes) + "/" +
+                to_string(fileSize) + " bytes) — discarding");
+        remove(temp_file.c_str());
+        return;
+    }
+
+    if (is_encrypted) {
+        try {
+            if (Crypto::decryptFile(temp_file, filename, encrypted_aes_key, iv)) {
+                remove(temp_file.c_str());
+                logSync("[LEGACY] Received and decrypted '" + filename +
+                       "' from " + client_ip);
+            } else {
+                logSync("[LEGACY] Decryption FAILED for '" + filename +
+                       "' from " + client_ip);
+            }
+        } catch (const exception& e) {
+            logSync("[LEGACY] Decryption error for '" + filename + "': " + e.what());
+        }
+    } else {
+        logSync("[LEGACY] Received '" + filename + "' from " + client_ip);
+    }
+}
+
+// ============================================================================
+// Group sync transfer path (transfer_type == 1)
+// For Step 4c: writes to .lanbox_recv_tmp_<filename> inside the group folder
+// and stops there. Rename-on-completion, metadata update, and pending_ops
+// retry-on-lock logic are added in Step 4g (the receive side of the offer/
+// accept protocol), since that's the step that actually triggers transfers
+// this way — 4c only proves the server can correctly route and write bytes.
+// ============================================================================
+
+void SyncManager::receiveGroupSyncTransfer(SocketType client_sock,
+                                           const string& group_id,
+                                           const string& relative_path,
+                                           const string& client_ip) {
+    auto recvAll = [&](void* buf, size_t len) -> bool {
+        size_t got = 0;
+        while (got < len) {
+            int n = recv(client_sock, (char*)buf + got, (int)(len - got), 0);
+            if (n <= 0) return false;
+            got += n;
+        }
+        return true;
+    };
+
+    // Resolve group folder from our known group list
+    string folder_path;
+    {
+        lock_guard<mutex> lock(groups_mutex_);
+        for (const auto& g : known_groups_) {
+            if (g.group_id == group_id) { folder_path = g.folder_path; break; }
+        }
+    }
+
+    if (folder_path.empty()) {
+        logSync("[SYNC-RECV] Unknown group_id '" + group_id + "' from " +
+               client_ip + " — rejecting transfer");
+        closesocket(client_sock);
+        return;
+    }
+
+    // Same wire format as legacy from this point: nameLen+name, size,
+    // is_encrypted, [key+iv], data. Filename here should match relative_path
+    // but we read it anyway since the wire format always sends it.
+    uint32_t nameLenNet;
+    if (!recvAll(&nameLenNet, sizeof(nameLenNet))) { closesocket(client_sock); return; }
+    uint32_t nameLen = ntohl(nameLenNet);
+    if (nameLen == 0 || nameLen > 4096) { closesocket(client_sock); return; }
+
+    string wire_filename(nameLen, '\0');
+    if (!recvAll(&wire_filename[0], nameLen)) { closesocket(client_sock); return; }
+
+    uint64_t sizeNet;
+    if (!recvAll(&sizeNet, sizeof(sizeNet))) { closesocket(client_sock); return; }
+#if defined(_WIN32)
+    uint64_t fileSize = _byteswap_uint64(sizeNet);
+#else
+    uint64_t fileSize = be64toh(sizeNet);
+#endif
+
+    uint8_t is_encrypted;
+    if (!recvAll(&is_encrypted, sizeof(is_encrypted))) { closesocket(client_sock); return; }
+
+    vector<unsigned char> encrypted_aes_key;
+    vector<unsigned char> iv;
+    if (is_encrypted) {
+        uint32_t key_len_net;
+        if (!recvAll(&key_len_net, sizeof(key_len_net))) { closesocket(client_sock); return; }
+        uint32_t key_len = ntohl(key_len_net);
+        if (key_len == 0 || key_len > 4096) { closesocket(client_sock); return; }
+
+        encrypted_aes_key.resize(key_len);
+        if (!recvAll(encrypted_aes_key.data(), key_len)) { closesocket(client_sock); return; }
+
+        iv.resize(16);
+        if (!recvAll(iv.data(), 16)) { closesocket(client_sock); return; }
+    }
+
+    // Build the temp file path: <folder_path>/.lanbox_recv_tmp_<relative_path>
+    // For nested paths, the prefix goes on the filename component only.
+    string sep =
+#ifdef _WIN32
+        "\\";
+#else
+        "/";
+#endif
+    string dir_part, name_part = relative_path;
+    size_t last_sep = relative_path.find_last_of("/\\");
+    if (last_sep != string::npos) {
+        dir_part  = relative_path.substr(0, last_sep + 1);
+        name_part = relative_path.substr(last_sep + 1);
+    }
+    string tmp_path = folder_path + sep + dir_part + RECV_TMP_PREFIX + name_part;
+
+    logSync("[SYNC-RECV] Receiving '" + relative_path + "' (" +
+           to_string(fileSize) + " bytes) for group " + group_id +
+           " from " + client_ip + (is_encrypted ? " [encrypted]" : ""));
+
+    ofstream outfile(tmp_path, ios::binary);
+    if (!outfile.is_open()) {
+        cerr << "[SyncManager] Cannot open temp file: " << tmp_path << "\n";
+        closesocket(client_sock);
+        return;
+    }
+
+    vector<char> buffer(TRANSFER_BUFFER_SIZE);
+    uint64_t received_bytes = 0;
+
+    while (received_bytes < fileSize) {
+        int n = recv(client_sock, buffer.data(),
+                    (int)min((uint64_t)TRANSFER_BUFFER_SIZE, fileSize - received_bytes), 0);
+        if (n <= 0) break;
+        outfile.write(buffer.data(), n);
+        received_bytes += n;
+    }
+    outfile.close();
+    closesocket(client_sock);
+
+    if (received_bytes != fileSize) {
+        logSync("[SYNC-RECV] Transfer incomplete for '" + relative_path +
+               "' from " + client_ip + " (" + to_string(received_bytes) + "/" +
+               to_string(fileSize) + " bytes) — discarding temp file");
+        remove(tmp_path.c_str());
+        return;
+    }
+
+    // 4c stops here: temp file is fully written and verified by size.
+    // Decryption, rename-to-final, metadata update, and pending_ops
+    // integration are added in Step 4g.
+    logSync("[SYNC-RECV] Temp file written: " + tmp_path +
+           " (awaiting finalize logic from Step 4g)");
+
+    // Stash encrypted_aes_key/iv handling note: for 4c we don't yet decrypt
+    // group-sync transfers since finalize (decrypt + rename) belongs to 4g.
+    // The encrypted bytes sit in tmp_path as-is until then.
+    (void)encrypted_aes_key;
+    (void)iv;
 }
 
 void SyncManager::ipcLoop() {

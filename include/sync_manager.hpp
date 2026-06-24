@@ -17,6 +17,8 @@ using json = nlohmann::json;
 using namespace std;
 
 const uint16_t SYNC_SIGNALING_PORT = 5003;
+const uint16_t SYNC_TRANSFER_PORT = 5000;
+const int      TRANSFER_BUFFER_SIZE = 64 * 1024; // 64 KB, matches existing wire format
 
 // ============================================================================
 // Sync engine state
@@ -200,4 +202,29 @@ private:
     void onGroupJoinApprove (const GroupJoinApprovePayload& fixed, const string& group_json, const string& sender_ip);
     void onGroupJoinDeny    (const GroupJoinDenyPayload& p, const string& sender_ip);
     void onGroupKick        (const GroupKickPayload& p, const string& sender_ip);
+
+// ── Transfer socket (TCP :5000) — persistent multi-connection server ────
+    SocketType transfer_listen_socket_ = INVALID_SOCKET_VAL;
+    bool initTransferSocket();
+    void closeTransferSocket();
+
+    // Spawned per accepted connection — runs on its own thread
+    void handleIncomingConnection(SocketType client_sock, string client_ip);
+
+    // Legacy path: transfer_type == 0 — adapts the original receiveFile()
+    // wire format, but per-connection rather than single-shot.
+    void receiveLegacyTransfer(SocketType client_sock, const string& client_ip);
+
+    // Group sync path: transfer_type == 1 — writes to .lanbox_recv_tmp_<filename>
+    // inside the resolved group folder. Rename-on-completion, metadata update,
+    // and pending_ops integration arrive in Step 4g.
+    void receiveGroupSyncTransfer(SocketType client_sock,
+                                  const string& group_id,
+                                  const string& relative_path,
+                                  const string& client_ip);
+
+    // Track active connection-handler threads so stopDaemon() can join them
+    mutex              transfer_threads_mutex_;
+    vector<thread>     transfer_threads_;
+    void reapFinishedTransferThreads(); // called periodically to join completed threads
 };
